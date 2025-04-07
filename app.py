@@ -5,6 +5,271 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from simulation import generate_weekly_sends
 import time
+from scipy import stats
+
+
+def aggregate_simulation_results(simulation_results, confidence_level=0.95):
+    """
+    Aggregate data from multiple simulation runs and calculate statistics.
+    
+    Parameters:
+    -----------
+    simulation_results : list
+        List of DataFrames containing results from each simulation run
+    confidence_level : float, default=0.95
+        Confidence level for calculating confidence intervals
+    
+    Returns:
+    --------
+    dict
+        Dictionary containing aggregated statistics
+    """
+    if not simulation_results:
+        return None
+    
+    # Extract key statistics from each simulation
+    n_simulations = len(simulation_results)
+    
+    # Initialize dictionaries to store aggregated data
+    agg_data = {
+        'weekly_distributions': {},  # SL -> week -> [distribution values]
+        'weekly_ctrs': {},  # SL -> week -> [ctr values]
+        'cumulative_ctrs': {},  # SL -> week -> [cumulative ctr values]
+        'final_distributions': {},  # SL -> [final distribution values]
+        'final_ctrs': {},  # SL -> [final ctr values]
+        'simulation_durations': [],  # List of simulation durations (weeks)
+        'exploration_costs': [],  # List of exploration costs
+        'exploration_percentages': [],  # List of exploration cost percentages
+        'initial_subject_lines': set(),  # Set of initial subject lines
+        'new_subject_lines': set(),  # Set of new subject lines introduced
+        'winners': {},  # SL -> count of times it was the winner
+    }
+    
+    # Helper function to extract subject line names from active_sls string
+    def extract_sls(active_sls):
+        return active_sls.split(',') if isinstance(active_sls, str) else []
+    
+    # Helper function to calculate statistics
+    def calculate_stats(values):
+        values = np.array(values)
+        mean = np.mean(values)
+        
+        # Calculate confidence interval
+        if len(values) > 1:
+            confidence = confidence_level
+            z = 1.96  # for 95% confidence
+            if confidence == 0.90:
+                z = 1.645
+            elif confidence == 0.99:
+                z = 2.576
+                
+            std_err = np.std(values, ddof=1) / np.sqrt(len(values))
+            margin = z * std_err
+            ci_lower = mean - margin
+            ci_upper = mean + margin
+        else:
+            ci_lower = mean
+            ci_upper = mean
+            
+        return {
+            'mean': mean,
+            'std': np.std(values) if len(values) > 1 else 0,
+            'ci_lower': ci_lower,
+            'ci_upper': ci_upper,
+            'min': np.min(values) if len(values) > 0 else 0,
+            'max': np.max(values) if len(values) > 0 else 0,
+            'values': values.tolist()
+        }
+    
+    # Process each simulation
+    for i, df in enumerate(simulation_results):
+        # Get all subject lines that appeared in the simulation
+        all_sls = set()
+        for week_row in df.iterrows():
+            active_sl_str = week_row[1].get('active_sls', '')
+            all_sls.update(extract_sls(active_sl_str))
+        
+        # Get initial subject lines (week 1)
+        if not df.empty:
+            first_week = df[df['week'] == 1]
+            if not first_week.empty:
+                active_sls_first_week = extract_sls(first_week.iloc[0].get('active_sls', ''))
+                agg_data['initial_subject_lines'].update(active_sls_first_week)
+                
+                # Any subject line not in first week is a new subject line
+                for sl in all_sls:
+                    if sl not in active_sls_first_week:
+                        agg_data['new_subject_lines'].add(sl)
+        
+        # Process weekly distributions and CTRs
+        for sl in all_sls:
+            # Initialize if not yet in the dictionaries
+            if sl not in agg_data['weekly_distributions']:
+                agg_data['weekly_distributions'][sl] = {}
+                agg_data['weekly_ctrs'][sl] = {}
+                agg_data['cumulative_ctrs'][sl] = {}
+                agg_data['final_distributions'][sl] = []
+                agg_data['final_ctrs'][sl] = []
+            
+            for week_num in df['week'].unique():
+                week_data = df[df['week'] == week_num]
+                if not week_data.empty:
+                    # Distribution
+                    if f'{sl}_distribution' in week_data.columns:
+                        dist_value = week_data.iloc[0][f'{sl}_distribution']
+                        if week_num not in agg_data['weekly_distributions'][sl]:
+                            agg_data['weekly_distributions'][sl][week_num] = []
+                        agg_data['weekly_distributions'][sl][week_num].append(dist_value)
+                    
+                    # Weekly CTR
+                    if f'{sl}_weekly_ctr' in week_data.columns:
+                        ctr_value = week_data.iloc[0][f'{sl}_weekly_ctr']
+                        if week_num not in agg_data['weekly_ctrs'][sl]:
+                            agg_data['weekly_ctrs'][sl][week_num] = []
+                        agg_data['weekly_ctrs'][sl][week_num].append(ctr_value)
+                    
+                    # Cumulative CTR
+                    if f'{sl}_cumulative_ctr' in week_data.columns:
+                        cum_ctr_value = week_data.iloc[0][f'{sl}_cumulative_ctr']
+                        if week_num not in agg_data['cumulative_ctrs'][sl]:
+                            agg_data['cumulative_ctrs'][sl][week_num] = []
+                        agg_data['cumulative_ctrs'][sl][week_num].append(cum_ctr_value)
+        
+        # Calculate simulation duration
+        duration = max(df['week']) if not df.empty else 0
+        agg_data['simulation_durations'].append(duration)
+        
+        # Get final distributions and CTRs
+        last_week = df[df['week'] == duration]
+        if not last_week.empty:
+            for sl in all_sls:
+                if f'{sl}_distribution' in last_week.columns:
+                    # Use the distribution that was active during the final week, not the prediction for the next week
+                    final_dist = last_week.iloc[0][f'{sl}_distribution']
+                    agg_data['final_distributions'][sl].append(final_dist)
+                    
+                    # Check if this SL was the winner (100% distribution)
+                    if final_dist == 100:
+                        if sl not in agg_data['winners']:
+                            agg_data['winners'][sl] = 0
+                        agg_data['winners'][sl] += 1
+                
+                if f'{sl}_cumulative_ctr' in last_week.columns:
+                    final_ctr = last_week.iloc[0][f'{sl}_cumulative_ctr']
+                    agg_data['final_ctrs'][sl].append(final_ctr)
+        
+        # Calculate exploration cost
+        if not df.empty:
+            last_week_data = df[df['week'] == duration].iloc[0]
+            
+            # Get initial subject lines
+            initial_sls = list(agg_data['initial_subject_lines'])
+            new_sls = list(agg_data['new_subject_lines'])
+            
+            # Find the best initial subject line CTR
+            best_initial_sl_ctr = 0
+            best_initial_sl = None
+            
+            for sl in initial_sls:
+                if f'{sl}_cumulative_ctr' in last_week_data:
+                    ctr = last_week_data[f'{sl}_cumulative_ctr']
+                    if ctr > best_initial_sl_ctr:
+                        best_initial_sl_ctr = ctr
+                        best_initial_sl = sl
+            
+            # Calculate exploration cost
+            if best_initial_sl and best_initial_sl_ctr > 0:
+                actual_opens = 0
+                potential_opens = 0
+                
+                for sl in new_sls:
+                    if f'{sl}_cumulative_sends' in last_week_data and f'{sl}_cumulative_opens' in last_week_data:
+                        sends = last_week_data[f'{sl}_cumulative_sends']
+                        opens = last_week_data[f'{sl}_cumulative_opens']
+                        
+                        actual_opens += opens
+                        potential_opens += sends * (best_initial_sl_ctr / 100)
+                
+                exploration_cost = max(0, potential_opens - actual_opens)
+                agg_data['exploration_costs'].append(exploration_cost)
+                
+                # Calculate total opens
+                total_opens = 0
+                for sl in all_sls:
+                    if f'{sl}_cumulative_opens' in last_week_data:
+                        total_opens += last_week_data[f'{sl}_cumulative_opens']
+                
+                if total_opens > 0:
+                    exploration_percentage = exploration_cost / total_opens * 100
+                    agg_data['exploration_percentages'].append(exploration_percentage)
+    
+    # Calculate statistics for each aggregated metric
+    aggregate_stats = {
+        'n_simulations': n_simulations,
+        'simulation_duration': calculate_stats(agg_data['simulation_durations']),
+        'initial_subject_lines': list(agg_data['initial_subject_lines']),
+        'new_subject_lines': list(agg_data['new_subject_lines']),
+        'exploration_cost': calculate_stats(agg_data['exploration_costs']),
+        'exploration_percentage': calculate_stats(agg_data['exploration_percentages']),
+        'winners': {sl: {'count': count, 'percentage': count / n_simulations * 100} 
+                   for sl, count in agg_data['winners'].items()},
+        'weekly_distributions': {},
+        'weekly_ctrs': {},
+        'cumulative_ctrs': {},
+        'final_distributions': {},
+        'final_ctrs': {}
+    }
+    
+    # Calculate statistics for weekly metrics
+    for sl in agg_data['weekly_distributions']:
+        aggregate_stats['weekly_distributions'][sl] = {}
+        for week in agg_data['weekly_distributions'][sl]:
+            values = agg_data['weekly_distributions'][sl][week]
+            aggregate_stats['weekly_distributions'][sl][week] = calculate_stats(values)
+    
+    for sl in agg_data['weekly_ctrs']:
+        aggregate_stats['weekly_ctrs'][sl] = {}
+        for week in agg_data['weekly_ctrs'][sl]:
+            values = agg_data['weekly_ctrs'][sl][week]
+            aggregate_stats['weekly_ctrs'][sl][week] = calculate_stats(values)
+    
+    for sl in agg_data['cumulative_ctrs']:
+        aggregate_stats['cumulative_ctrs'][sl] = {}
+        for week in agg_data['cumulative_ctrs'][sl]:
+            values = agg_data['cumulative_ctrs'][sl][week]
+            aggregate_stats['cumulative_ctrs'][sl][week] = calculate_stats(values)
+    
+    # Calculate statistics for final metrics
+    for sl in agg_data['final_distributions']:
+        values = agg_data['final_distributions'][sl]
+        aggregate_stats['final_distributions'][sl] = calculate_stats(values)
+    
+    for sl in agg_data['final_ctrs']:
+        values = agg_data['final_ctrs'][sl]
+        aggregate_stats['final_ctrs'][sl] = calculate_stats(values)
+    
+    return aggregate_stats
+
+
+def calculate_confidence_interval(data, confidence=0.95):
+    """Calculate confidence interval for a list of values."""
+    if len(data) < 2:
+        return data[0] if data else 0, data[0] if data else 0
+    
+    mean = np.mean(data)
+    
+    # Set z-score based on confidence level
+    z = 1.96  # for 95% confidence
+    if confidence == 0.90:
+        z = 1.645
+    elif confidence == 0.99:
+        z = 2.576
+        
+    std_err = np.std(data, ddof=1) / np.sqrt(len(data))
+    margin = z * std_err
+    
+    return mean - margin, mean + margin
+
 
 # Set page configuration
 st.set_page_config(
@@ -28,6 +293,17 @@ n_initial_subjectlines = st.sidebar.slider("Initial Subject Lines", min_value=5,
 max_subjectlines = st.sidebar.slider("Maximum Subject Lines", min_value=n_initial_subjectlines, max_value=20, value=15, step=1)
 epsilon = st.sidebar.slider("Epsilon (New SL Allocation)", min_value=0.1, max_value=0.5, value=0.2, step=0.05)
 new_sl_weeks = st.sidebar.slider("New SL Weeks", min_value=1, max_value=5, value=2, step=1)
+
+# Add parameter for multiple runs
+st.sidebar.header("Monte Carlo Settings")
+run_monte_carlo = st.sidebar.checkbox("Run Multiple Simulations", value=False)
+if run_monte_carlo:
+    n_simulations = st.sidebar.slider("Number of Simulations", min_value=10, max_value=100, value=30, step=10)
+    confidence_level = st.sidebar.slider("Confidence Level (%)", min_value=80, max_value=99, value=95, step=1)
+    st.sidebar.info("Running multiple simulations will take longer but provide statistical confidence intervals.")
+else:
+    n_simulations = 1
+    confidence_level = 95
 
 # Open Rate Settings
 st.sidebar.header("Subject Line Open Rates")
@@ -80,7 +356,7 @@ if use_custom_rates:
 
 # Run simulation button
 if st.sidebar.button("Run Simulation"):
-    with st.spinner("Running simulation..."):
+    with st.spinner(f"Running {'multiple simulations' if run_monte_carlo else 'simulation'}..."):
         # Create containers to capture the print outputs
         simulation_output = st.empty()
         
@@ -91,265 +367,272 @@ if st.sidebar.button("Run Simulation"):
         
         # Create a StringIO object to capture output
         f = io.StringIO()
+        
+        # Lists to store results from multiple simulations
+        all_simulation_results = []
+        
         with contextlib.redirect_stdout(f):
-            # Run the simulation with custom open rates if specified
-            result_df = generate_weekly_sends(
-                n_weeks=n_weeks, 
-                n_subjectlines=n_initial_subjectlines, 
-                max_subjectlines=max_subjectlines,
-                epsilon=epsilon,
-                new_sl_weeks=new_sl_weeks,
-                custom_min_rates=custom_min_rates if use_custom_rates else None,
-                custom_max_rates=custom_max_rates if use_custom_rates else None
-            )
+            if run_monte_carlo:
+                progress_bar = st.progress(0)
+                for sim_idx in range(n_simulations):
+                    # Update progress bar
+                    progress_bar.progress((sim_idx + 1) / n_simulations)
+                    
+                    # Run a single simulation
+                    result_df = generate_weekly_sends(
+                        n_weeks=n_weeks, 
+                        n_subjectlines=n_initial_subjectlines, 
+                        max_subjectlines=max_subjectlines,
+                        epsilon=epsilon,
+                        new_sl_weeks=new_sl_weeks,
+                        custom_min_rates=custom_min_rates if use_custom_rates else None,
+                        custom_max_rates=custom_max_rates if use_custom_rates else None,
+                        verbose=(sim_idx == 0)  # Only show verbose output for first run
+                    )
+                    all_simulation_results.append(result_df)
+                    
+                # Aggregate results from all simulations
+                result_df = all_simulation_results[0]  # Use the first run for primary display
+                aggregate_results = aggregate_simulation_results(all_simulation_results, confidence_level/100)
+                
+                # Show completion message
+                progress_bar.empty()
+                st.success(f"Completed {n_simulations} simulations!")
+            else:
+                # Just run a single simulation
+                result_df = generate_weekly_sends(
+                    n_weeks=n_weeks, 
+                    n_subjectlines=n_initial_subjectlines, 
+                    max_subjectlines=max_subjectlines,
+                    epsilon=epsilon,
+                    new_sl_weeks=new_sl_weeks,
+                    custom_min_rates=custom_min_rates if use_custom_rates else None,
+                    custom_max_rates=custom_max_rates if use_custom_rates else None,
+                    verbose=True
+                )
+                all_simulation_results = [result_df]
+                aggregate_results = None
         
-        # Get the captured output
-        output_text = f.getvalue()
+        # Display the captured output
+        simulation_log = f.getvalue()
         
-        # Create tabs for different visualizations
-        tab1, tab2, tab3, tab4, tab5 = st.tabs(["Simulation Log", "Summary", "Metrics", "Visualizations", "Raw Data"])
+        # Identify all subject lines that were used
+        used_sls = []
+        for idx, row in result_df.iterrows():
+            if 'active_sls' in row:
+                sls = row['active_sls'].split(',')
+                for sl in sls:
+                    if sl and sl not in used_sls:
+                        used_sls.append(sl)
         
-        with tab1:
-            st.subheader("Simulation Log")
-            st.text(output_text)
+        # Create data for visualizations
+        weekly_dists = {}
+        weekly_ctrs = {}
+        weekly_ctr_df = pd.DataFrame(index=result_df['week'])
+        cumulative_ctr_df = pd.DataFrame(index=result_df['week'])
         
-        # Get all possible subject line names
-        all_sl_names = [f"SL_{i}" for i in range(1, max_subjectlines + 1)]
-        
-        # Find which subject lines were actually used in the simulation
-        used_sl_cols = [col for col in result_df.columns if any(col.startswith(f"{sl}_") for sl in all_sl_names)]
-        used_sls = sorted(list(set([col.split('_')[0] + '_' + col.split('_')[1] for col in used_sl_cols])))
-        
-        # Create a function to get active subject lines for each week
-        def get_active_sls_for_week(week_row):
-            return week_row['active_sls'].split(',') if 'active_sls' in week_row else []
-        
-        # Extract data for each visualization from the result DataFrame
-        
-        # Distribution data - only include active subject lines for each week
-        dist_data = {}
         for sl in used_sls:
             if f'{sl}_distribution' in result_df.columns:
-                dist_data[sl] = result_df[f'{sl}_distribution'] * 100
-        
-        dist_df = pd.DataFrame(dist_data)
-        dist_df.index = [f"Week {int(w)}" for w in result_df['week']]
-        
-        # Weekly sends data
-        sends_data = {}
-        for sl in used_sls:
-            if f'{sl}_sends' in result_df.columns:
-                sends_data[sl] = result_df[f'{sl}_sends']
-        
-        weekly_sends_df = pd.DataFrame(sends_data)
-        weekly_sends_df.index = [f"Week {int(w)}" for w in result_df['week']]
-        
-        # Weekly opens data
-        opens_data = {}
-        for sl in used_sls:
-            if f'{sl}_opens' in result_df.columns:
-                opens_data[sl] = result_df[f'{sl}_opens']
-        
-        weekly_opens_df = pd.DataFrame(opens_data)
-        weekly_opens_df.index = [f"Week {int(w)}" for w in result_df['week']]
-        
-        # Cumulative sends data
-        cum_sends_data = {}
-        for sl in used_sls:
-            if f'{sl}_cumulative_sends' in result_df.columns:
-                cum_sends_data[sl] = result_df[f'{sl}_cumulative_sends']
-        
-        cumulative_sends_df = pd.DataFrame(cum_sends_data)
-        cumulative_sends_df.index = [f"Week {int(w)}" for w in result_df['week']]
-        
-        # Cumulative opens data
-        cum_opens_data = {}
-        for sl in used_sls:
-            if f'{sl}_cumulative_opens' in result_df.columns:
-                cum_opens_data[sl] = result_df[f'{sl}_cumulative_opens']
-        
-        cumulative_opens_df = pd.DataFrame(cum_opens_data)
-        cumulative_opens_df.index = [f"Week {int(w)}" for w in result_df['week']]
-        
-        # Weekly CTR data
-        weekly_ctr_data = {}
-        for sl in used_sls:
+                weekly_dists[sl] = result_df[f'{sl}_distribution']
+            
             if f'{sl}_weekly_ctr' in result_df.columns:
-                weekly_ctr_data[sl] = result_df[f'{sl}_weekly_ctr']
+                weekly_ctrs[sl] = result_df[f'{sl}_weekly_ctr']
+                weekly_ctr_df[sl] = result_df[f'{sl}_weekly_ctr']
+                cumulative_ctr_df[sl] = result_df[f'{sl}_cumulative_ctr']
         
-        weekly_ctr_df = pd.DataFrame(weekly_ctr_data)
-        weekly_ctr_df.index = [f"Week {int(w)}" for w in result_df['week']]
+        # Create main tabs
+        tab1, tab2, tab3, tab4, tab5 = st.tabs(["Simulation Log", "Summary", "Metrics", "Visualizations", "Raw Data"])
         
-        # Cumulative CTR data
-        cum_ctr_data = {}
-        for sl in used_sls:
-            if f'{sl}_cumulative_ctr' in result_df.columns:
-                cum_ctr_data[sl] = result_df[f'{sl}_cumulative_ctr']
+        # Simulation Log Tab
+        with tab1:
+            st.subheader("Simulation Log")
+            st.text(simulation_log)
         
-        cumulative_ctr_df = pd.DataFrame(cum_ctr_data)
-        cumulative_ctr_df.index = [f"Week {int(w)}" for w in result_df['week']]
-        
-        # Status data
-        status_data = {}
-        for sl in used_sls:
-            if f'{sl}_status' in result_df.columns:
-                status_data[sl] = result_df[f'{sl}_status']
-        
-        status_df = pd.DataFrame(status_data)
-        status_df.index = [f"Week {int(w)}" for w in result_df['week']]
-        
-        # Summary Tab
+        # Summary Tab  
         with tab2:
             st.subheader("Simulation Summary")
             
-            # Find if simulation ended early with a winner
-            simulation_ended_early = len(result_df) <= n_weeks  # No prediction row means it ended early
-            winner_found = False
-            winner_sl = None
-            winner_week = None
+            if run_monte_carlo:
+                st.info(f"Results aggregated over {n_simulations} simulations with {confidence_level}% confidence intervals.")
             
-            for idx, row in result_df.iterrows():
-                for sl in used_sls:
-                    if f'{sl}_distribution' in row and row[f'{sl}_distribution'] == 1.0:
-                        winner_found = True
-                        winner_sl = sl
-                        winner_week = int(row['week'])
-                        break
-                if winner_found:
-                    break
+            # Display final week metrics
+            st.subheader("Final Week Metrics")
             
             # Get last week data (excluding the prediction row if it exists)
             last_week_data = result_df.iloc[-2] if len(result_df) > n_weeks else result_df.iloc[-1]
             
-            # Overall metrics
+            # Create columns to display metrics
             cols = st.columns(4)
-            
-            # Total active subject lines used
-            used_sl_count = len(set(sl for week_active_sls in [row['active_sls'].split(',') for _, row in result_df.iterrows() if 'active_sls' in row] for sl in week_active_sls))
-            
-            # Overall metrics
-            total_sends = sum(last_week_data[[f'{sl}_cumulative_sends' for sl in used_sls if f'{sl}_cumulative_sends' in last_week_data]])
-            total_opens = sum(last_week_data[[f'{sl}_cumulative_opens' for sl in used_sls if f'{sl}_cumulative_opens' in last_week_data]])
-            overall_ctr = total_opens / total_sends * 100 if total_sends > 0 else 0
-            
             with cols[0]:
-                st.metric("Total Sends", f"{int(total_sends):,}")
+                st.metric("Total Weeks", max(result_df['week']))
             with cols[1]:
-                st.metric("Total Opens", f"{int(total_opens):,}")
+                total_sends = sum(result_df['total_sends'])
+                st.metric("Total Sends", f"{total_sends:,}")
             with cols[2]:
-                st.metric("Overall CTR", f"{overall_ctr:.2f}%")
+                # Calculate total opens across all subject lines
+                total_opens = 0
+                for sl in used_sls:
+                    if f'{sl}_cumulative_opens' in last_week_data:
+                        total_opens += last_week_data[f'{sl}_cumulative_opens']
+                st.metric("Total Opens", f"{int(total_opens):,}")
             with cols[3]:
-                st.metric("Subject Lines Used", f"{used_sl_count}")
+                # Calculate overall CTR
+                overall_ctr = (total_opens / total_sends * 100) if total_sends > 0 else 0
+                st.metric("Overall CTR", f"{overall_ctr:.2f}%")
             
-            # Winner information if found
-            if winner_found:
-                st.success(f"🏆 Winner found! {winner_sl} reached 100% distribution in Week {winner_week}.")
-            
-            # Subject line status tracking
-            st.subheader("Subject Line Introduction and Status")
-            
-            # Create a table showing when each subject line was introduced and its status
-            intro_data = []
-            for sl in used_sls:
-                # Find the first week this subject line was active
-                intro_week = None
-                final_status = "inactive"
-                final_dist = 0.0
-                cumulative_sends = 0
-                cumulative_opens = 0
-                cumulative_ctr = 0.0
+            # Monte Carlo Results
+            if run_monte_carlo and aggregate_results:
+                st.subheader("Aggregate Performance Metrics")
                 
+                # Display aggregate metrics with confidence intervals
+                agg_cols = st.columns(3)
+                with agg_cols[0]:
+                    if 'simulation_duration' in aggregate_results:
+                        mean_weeks = aggregate_results['simulation_duration']['mean']
+                        ci_low = aggregate_results['simulation_duration']['ci_lower']
+                        ci_high = aggregate_results['simulation_duration']['ci_upper']
+                        st.metric("Avg Simulation Duration", f"{mean_weeks:.1f} weeks")
+                        st.caption(f"95% CI: [{ci_low:.1f}, {ci_high:.1f}]")
+                    else:
+                        st.metric("Avg Simulation Duration", "N/A")
+                    
+                with agg_cols[1]:
+                    # Calculate overall CTR across all simulations
+                    overall_ctrs = []
+                    for sim_df in all_simulation_results:
+                        if not sim_df.empty:
+                            total_sends = sim_df['total_sends'].sum()
+                            total_opens = 0
+                            
+                            # Get the last week data
+                            last_week = sim_df.iloc[-2] if len(sim_df) > n_weeks else sim_df.iloc[-1]
+                            
+                            # Sum up all opens
+                            for sl in used_sls:
+                                if f'{sl}_cumulative_opens' in last_week:
+                                    total_opens += last_week[f'{sl}_cumulative_opens']
+                            
+                            if total_sends > 0:
+                                overall_ctrs.append(total_opens / total_sends * 100)
+                    
+                    if overall_ctrs:
+                        mean_ctr = np.mean(overall_ctrs)
+                        ci_low, ci_high = calculate_confidence_interval(overall_ctrs, confidence_level/100)
+                        st.metric("Avg Overall CTR", f"{mean_ctr:.2f}%")
+                        st.caption(f"95% CI: [{ci_low:.2f}%, {ci_high:.2f}%]")
+                    else:
+                        st.metric("Avg Overall CTR", "N/A")
+                    
+                with agg_cols[2]:
+                    if 'new_subject_lines' in aggregate_results:
+                        mean_new_sls = len(aggregate_results['new_subject_lines'])
+                        st.metric("New Subject Lines", f"{mean_new_sls}")
+                    else:
+                        st.metric("New Subject Lines", "N/A")
+                
+                # Display aggregate subject line metrics
+                st.subheader("Subject Line Performance")
+                st.caption("Shows metrics from the final week of each simulation (not predictions for future weeks)")
+                
+                # Create a formatted dataframe for display
+                sl_results = []
+                
+                for sl in used_sls:
+                    if sl in aggregate_results['final_ctrs']:
+                        ctr_stats = aggregate_results['final_ctrs'][sl]
+                        mean_ctr = ctr_stats['mean']
+                        ci_low_ctr = ctr_stats['ci_lower']
+                        ci_high_ctr = ctr_stats['ci_upper']
+                        
+                        dist_stats = aggregate_results['final_distributions'][sl] if sl in aggregate_results['final_distributions'] else None
+                        mean_dist = dist_stats['mean'] * 100 if dist_stats else 0  # Convert to percentage
+                        
+                        # Calculate winner frequency
+                        winner_freq = 0
+                        if 'winners' in aggregate_results and sl in aggregate_results['winners']:
+                            winner_freq = aggregate_results['winners'][sl]['percentage']
+                        
+                        sl_results.append({
+                            'Subject Line': sl,
+                            'Final CTR': f"{mean_ctr:.2f}%",
+                            '95% CI': f"[{ci_low_ctr:.2f}%, {ci_high_ctr:.2f}%]",
+                            'Avg Final Distribution': f"{mean_dist:.2f}%",
+                            'Winner Frequency': f"{winner_freq:.1f}%"
+                        })
+                
+                if sl_results:
+                    sl_results_df = pd.DataFrame(sl_results)
+                    st.dataframe(sl_results_df)
+                else:
+                    st.info("No subject line statistics available.")
+                
+                # Plot winner distribution
+                st.subheader("Winner Distribution")
+                if 'winners' in aggregate_results and aggregate_results['winners']:
+                    fig, ax = plt.subplots(figsize=(10, 5))
+                    
+                    # Sort winners by frequency
+                    sorted_winners = sorted(aggregate_results['winners'].items(), 
+                                           key=lambda x: x[1]['percentage'], 
+                                           reverse=True)
+                    
+                    sls = [winner[0] for winner in sorted_winners]
+                    freqs = [winner[1]['percentage'] for winner in sorted_winners]
+                    
+                    bars = ax.bar(sls, freqs)
+                    ax.set_xlabel('Subject Line')
+                    ax.set_ylabel('Win Percentage (%)')
+                    ax.set_ylim(0, 100)
+                    
+                    # Add value labels
+                    for bar in bars:
+                        height = bar.get_height()
+                        ax.annotate(f'{height:.1f}%',
+                                   xy=(bar.get_x() + bar.get_width() / 2, height),
+                                   xytext=(0, 3),  # 3 points vertical offset
+                                   textcoords="offset points",
+                                   ha='center', va='bottom')
+                    
+                    plt.title('Percentage of Simulations Where Subject Line Was the Winner')
+                    plt.grid(axis='y', alpha=0.3)
+                    st.pyplot(fig)
+                else:
+                    st.info("No clear winners found across simulations.")
+            
+            # Subject Line Introduction
+            st.subheader("Subject Line Introduction Timeline")
+            
+            # Create a timeline of when each subject line was introduced
+            intro_weeks = {}
+            for sl in used_sls:
                 for idx, row in result_df.iterrows():
-                    active_sls = row['active_sls'].split(',') if 'active_sls' in row else []
-                    
-                    if sl in active_sls and intro_week is None:
-                        intro_week = int(row['week'])
-                    
-                    if f'{sl}_status' in row:
-                        final_status = row[f'{sl}_status']
-                    
-                    if f'{sl}_distribution' in row:
-                        final_dist = row[f'{sl}_distribution'] * 100
-                    
-                    if f'{sl}_cumulative_sends' in row:
-                        cumulative_sends = row[f'{sl}_cumulative_sends']
-                    
-                    if f'{sl}_cumulative_opens' in row:
-                        cumulative_opens = row[f'{sl}_cumulative_opens']
-                
-                if cumulative_sends > 0:
-                    cumulative_ctr = cumulative_opens / cumulative_sends * 100
-                
-                if intro_week is not None:
-                    intro_data.append({
-                        'Subject Line': sl,
-                        'Introduced Week': intro_week,
-                        'Final Status': final_status,
-                        'Final Distribution (%)': final_dist,
-                        'Total Sends': cumulative_sends,
-                        'Total Opens': cumulative_opens,
-                        'CTR (%)': cumulative_ctr
-                    })
+                    if 'active_sls' in row and sl in row['active_sls'].split(','):
+                        intro_weeks[sl] = row['week']
+                        break
             
-            intro_df = pd.DataFrame(intro_data)
-            if not intro_df.empty:
-                st.dataframe(intro_df.sort_values(['Introduced Week', 'Subject Line']))
+            # Sort by introduction week
+            sorted_sls = sorted(intro_weeks.items(), key=lambda x: x[1])
             
-            # Final distribution
-            st.subheader("Final Subject Line Distribution")
-            
-            # Get final distributions
-            final_week = result_df.iloc[-1]
-            final_dist_data = {}
-            for sl in used_sls:
-                if f'{sl}_distribution' in final_week:
-                    if final_week[f'{sl}_status'] != 'inactive':
-                        final_dist_data[sl] = final_week[f'{sl}_distribution'] * 100
-            
-            final_dist_df = pd.DataFrame([final_dist_data])
-            final_dist_df.index = ["Final Distribution (%)"]
-            st.dataframe(final_dist_df.T.sort_values("Final Distribution (%)", ascending=False))
-            
-            # Week by week summary
-            st.subheader("Week by Week Summary")
-            summary_data = []
-            for idx, row in result_df.iloc[:-1].iterrows() if len(result_df) > n_weeks else result_df.iterrows():
-                week_num = int(row['week'])
-                total_week_sends = row['total_sends']
+            # Display as a table
+            intro_data = []
+            for sl, week in sorted_sls:
+                # Get distribution for the final week (not prediction for next week)
+                final_dist = last_week_data[f'{sl}_distribution'] if f'{sl}_distribution' in last_week_data else 0
+                # Get final CTR
+                final_ctr = last_week_data[f'{sl}_cumulative_ctr'] if f'{sl}_cumulative_ctr' in last_week_data else 0
+                # Get final status
+                final_status = last_week_data[f'{sl}_status'] if f'{sl}_status' in last_week_data else "unknown"
                 
-                # Active subject lines for this week
-                active_sls_week = row['active_sls'].split(',') if 'active_sls' in row else []
-                
-                # Count new and standard subject lines
-                new_sls = [sl for sl in active_sls_week if f'{sl}_status' in row and row[f'{sl}_status'] == 'new']
-                standard_sls = [sl for sl in active_sls_week if f'{sl}_status' in row and row[f'{sl}_status'] == 'standard']
-                
-                # Total opens and CTR for this week
-                total_week_opens = sum([row[f'{sl}_opens'] for sl in active_sls_week if f'{sl}_opens' in row])
-                week_ctr = total_week_opens / total_week_sends * 100 if total_week_sends > 0 else 0
-                
-                # Find best performing subject line
-                best_sl = None
-                best_sl_ctr = 0
-                for sl in active_sls_week:
-                    if f'{sl}_weekly_ctr' in row and row[f'{sl}_weekly_ctr'] > best_sl_ctr:
-                        best_sl_ctr = row[f'{sl}_weekly_ctr']
-                        best_sl = sl
-                
-                summary_data.append({
-                    'Week': week_num,
-                    'Total Sends': total_week_sends,
-                    'Total Opens': total_week_opens,
-                    'CTR (%)': week_ctr,
-                    'Active SLs': len(active_sls_week),
-                    'New SLs': len(new_sls),
-                    'Standard SLs': len(standard_sls),
-                    'Best Subject Line': best_sl,
-                    'Best SL CTR (%)': best_sl_ctr
+                intro_data.append({
+                    "Subject Line": sl,
+                    "Introduced in Week": week,
+                    "Final Status": final_status.capitalize(),
+                    "Final Distribution": f"{final_dist:.2%}" if final_dist > 0 else "0%",
+                    "Final CTR": f"{final_ctr:.2f}%" if final_ctr > 0 else "0%"
                 })
             
-            summary_df = pd.DataFrame(summary_data)
-            st.dataframe(summary_df)
+            intro_df = pd.DataFrame(intro_data)
+            st.dataframe(intro_df)
         
         # Metrics Tab
         with tab3:
@@ -367,459 +650,521 @@ if st.sidebar.button("Run Simulation"):
                 - **New Subject Lines**: Any subject lines introduced after Week 1 when existing subject lines reach zero distribution
                 - **Best Initial Subject Line**: The initial subject line with the highest cumulative CTR
                 
+                **Open Rate Calculations:**
+                1. **Actual Open Rate**: The open rate achieved in the simulation based on actual subject line performance
+                2. **Counterfactual Open Rate**: The estimated open rate if we had only used the best initial subject line for all new subject line sends
+                3. **Open Rate Difference**: The difference between counterfactual and actual open rates
+                
                 **Exploration Cost Calculation:**
                 1. For each new subject line, we calculate:
                    - Actual Opens: The actual number of opens received
                    - Potential Opens: The opens we would have received if we used the best initial subject line instead
                    - The difference (if positive) is the exploration cost
-                
-                **Weekly Performance Delta:**
-                - For each week where new subject lines are introduced:
-                   - We compare the CTR of each new subject line against the best-performing initial subject line that week
-                   - Positive delta means the new subject line outperformed the best initial one
-                
-                **Parameter Tuning Metrics:**
-                - **Exploration Efficiency**: Ratio of actual opens from new subject lines to potential opens (higher is better)
-                - **Distribution Balance**: How evenly distributed the final allocation is (closer to 1 = more balanced)
-                - **Average Weekly CTR**: Simple average of all weekly CTRs across all subject lines
                 """)
             
-            # Get last week data (excluding the prediction row if it exists)
-            last_week_data = result_df.iloc[-2] if len(result_df) > n_weeks else result_df.iloc[-1]
-            
-            # 1. Identify initial subject lines (first n_initial_subjectlines)
-            initial_sls = [f"SL_{i}" for i in range(1, n_initial_subjectlines + 1)]
-            
-            # Check if they exist in the data
-            initial_sls = [sl for sl in initial_sls if f'{sl}_cumulative_ctr' in last_week_data]
-            
-            # 2. Identify new subject lines (introduced after week 1)
-            new_sls = []
-            for sl in used_sls:
-                for idx, row in result_df.iterrows():
-                    if row['week'] > 1 and 'active_sls' in row and sl in row['active_sls']:
-                        if sl not in new_sls and sl not in initial_sls:
-                            new_sls.append(sl)
-            
-            # 3. Calculate metrics for initial subject lines
-            if initial_sls:
-                # Find best performing initial subject line
-                initial_sl_ctrs = {sl: last_week_data[f'{sl}_cumulative_ctr'] 
-                                 for sl in initial_sls 
-                                 if f'{sl}_cumulative_ctr' in last_week_data}
+            if run_monte_carlo and aggregate_results:
+                st.info(f"Showing aggregate results from {n_simulations} simulations with {confidence_level}% confidence intervals")
                 
-                if initial_sl_ctrs:
-                    best_initial_sl = max(initial_sl_ctrs.items(), key=lambda x: x[1])[0]
-                    best_initial_ctr = initial_sl_ctrs[best_initial_sl]
+                # 1. Calculate actual vs counterfactual open rates across all simulations
+                actual_open_rates = []
+                counterfactual_open_rates = []
+                
+                for sim_df in all_simulation_results:
+                    # Get the last real week
+                    duration = max(sim_df['week']) if not sim_df.empty else 0
+                    last_week_data = sim_df[sim_df['week'] == duration].iloc[0]
                     
-                    st.subheader("Best Initial Subject Line")
-                    with st.expander("ℹ️ How is the best initial subject line determined?"):
-                        st.markdown(f"""
-                        The best initial subject line is determined by looking at all subject lines introduced in Week 1 
-                        and selecting the one with the highest cumulative CTR at the end of the simulation.
+                    # Identify initial subject lines
+                    initial_sls = []
+                    if not sim_df.empty:
+                        first_week = sim_df[sim_df['week'] == 1]
+                        if not first_week.empty and 'active_sls' in first_week.iloc[0]:
+                            initial_sls = first_week.iloc[0]['active_sls'].split(',')
+                    
+                    # Find best initial subject line
+                    best_initial_sl = None
+                    best_initial_ctr = 0
+                    
+                    for sl in initial_sls:
+                        if f'{sl}_cumulative_ctr' in last_week_data:
+                            ctr = last_week_data[f'{sl}_cumulative_ctr']
+                            if ctr > best_initial_ctr:
+                                best_initial_ctr = ctr
+                                best_initial_sl = sl
+                    
+                    if best_initial_sl:
+                        # Calculate actual total opens and sends
+                        total_sends = 0
+                        total_opens = 0
                         
-                        In this simulation, **{best_initial_sl}** had the highest cumulative CTR of **{best_initial_ctr:.2f}%** among initial subject lines.
+                        # Identify new subject lines (not in initial set)
+                        new_sls = [sl for sl in used_sls if sl not in initial_sls]
                         
-                        This subject line serves as the baseline for measuring the opportunity cost of exploration.
-                        """)
+                        # Calculate cumulative opens and sends
+                        for sl in initial_sls + new_sls:
+                            if f'{sl}_cumulative_sends' in last_week_data and f'{sl}_cumulative_opens' in last_week_data:
+                                sl_sends = last_week_data[f'{sl}_cumulative_sends']
+                                sl_opens = last_week_data[f'{sl}_cumulative_opens']
+                                
+                                total_sends += sl_sends
+                                total_opens += sl_opens
+                        
+                        # Calculate counterfactual opens (if we had used best initial SL for all new SL sends)
+                        counterfactual_opens = total_opens
+                        
+                        for sl in new_sls:
+                            if f'{sl}_cumulative_sends' in last_week_data and f'{sl}_cumulative_opens' in last_week_data:
+                                sl_sends = last_week_data[f'{sl}_cumulative_sends']
+                                sl_opens = last_week_data[f'{sl}_cumulative_opens']
+                                
+                                # Replace with best initial SL performance
+                                counterfactual_opens = counterfactual_opens - sl_opens + (sl_sends * best_initial_ctr / 100)
+                        
+                        # Calculate open rates
+                        if total_sends > 0:
+                            actual_open_rate = (total_opens / total_sends) * 100
+                            counterfactual_open_rate = (counterfactual_opens / total_sends) * 100
+                            
+                            actual_open_rates.append(actual_open_rate)
+                            counterfactual_open_rates.append(counterfactual_open_rate)
+                
+                # Calculate statistics for open rates
+                if actual_open_rates and counterfactual_open_rates:
+                    # Mean values
+                    mean_actual = np.mean(actual_open_rates)
+                    mean_counterfactual = np.mean(counterfactual_open_rates)
+                    mean_difference = mean_counterfactual - mean_actual
+                    
+                    # Confidence intervals
+                    actual_ci_low, actual_ci_high = calculate_confidence_interval(actual_open_rates, confidence_level/100)
+                    counterfactual_ci_low, counterfactual_ci_high = calculate_confidence_interval(counterfactual_open_rates, confidence_level/100)
+                    
+                    # Calculate differences for confidence interval on difference
+                    differences = [c - a for c, a in zip(counterfactual_open_rates, actual_open_rates)]
+                    diff_ci_low, diff_ci_high = calculate_confidence_interval(differences, confidence_level/100)
+                    
+                    # Display results
+                    st.subheader("Open Rate Analysis")
                     
                     cols = st.columns(3)
                     with cols[0]:
-                        st.metric("Best Initial SL", best_initial_sl)
+                        st.metric("Actual Open Rate", f"{mean_actual:.2f}%")
+                        st.caption(f"{confidence_level}% CI: [{actual_ci_low:.2f}%, {actual_ci_high:.2f}%]")
+                        st.markdown("*Based on the actual subject line performance*")
+                    
                     with cols[1]:
-                        st.metric("CTR", f"{best_initial_ctr:.2f}%")
+                        st.metric("Counterfactual Open Rate", f"{mean_counterfactual:.2f}%")
+                        st.caption(f"{confidence_level}% CI: [{counterfactual_ci_low:.2f}%, {counterfactual_ci_high:.2f}%]")
+                        st.markdown("*If only used best initial subject line*")
+                    
                     with cols[2]:
-                        total_initial_opens = sum([last_week_data[f'{sl}_cumulative_opens'] 
-                                                for sl in initial_sls 
-                                                if f'{sl}_cumulative_opens' in last_week_data])
-                        st.metric("Total Opens", f"{int(total_initial_opens):,}")
+                        st.metric("Open Rate Difference", f"{mean_difference:.2f}%", 
+                                 delta=f"{mean_difference:.2f}%" if mean_difference != 0 else None,
+                                 delta_color="inverse")
+                        st.caption(f"{confidence_level}% CI: [{diff_ci_low:.2f}%, {diff_ci_high:.2f}%]")
+                        st.markdown("*Positive = exploration cost, Negative = exploration gain*")
                     
-                    # 4. Calculate exploration cost
-                    exploration_cost = 0
-                    potential_opens = 0
-                    actual_opens = 0
+                    st.info(f"Across {n_simulations} simulations, exploring new subject lines {('decreased' if mean_difference > 0 else 'increased')} the overall open rate by {abs(mean_difference):.2f}% on average.")
                     
-                    # For each new subject line, calculate potential opens if best initial SL was used
-                    for sl in new_sls:
-                        if f'{sl}_cumulative_sends' in last_week_data and f'{sl}_cumulative_opens' in last_week_data:
-                            sl_sends = last_week_data[f'{sl}_cumulative_sends']
-                            sl_opens = last_week_data[f'{sl}_cumulative_opens']
-                            
-                            # Potential opens if best initial SL was used instead
-                            potential_sl_opens = sl_sends * (best_initial_ctr / 100)
-                            
-                            exploration_cost += max(0, potential_sl_opens - sl_opens)
-                            potential_opens += potential_sl_opens
-                            actual_opens += sl_opens
+                    # Display individual simulation data
+                    st.subheader("Simulation-level Open Rate Data")
                     
-                    st.subheader("Exploration Cost")
-                    with st.expander("ℹ️ How is exploration cost calculated?"):
-                        st.markdown(f"""
-                        **Exploration cost** represents the number of opens sacrificed by testing new subject lines instead of using the best initial subject line.
-                        
-                        **Formula:**
-                        ```
-                        For each new subject line:
-                            Potential Opens = Sends to New SL × (Best Initial SL CTR / 100)
-                            Exploration Cost = max(0, Potential Opens - Actual Opens)
-                        ```
-                        
-                        **In this simulation:**
-                        - New subject lines received **{int(actual_opens):,}** actual opens
-                        - If we had sent all those emails using the best initial subject line ({best_initial_sl}), 
-                          we would have received approximately **{int(potential_opens):,}** opens
-                        - This results in **{int(exploration_cost):,}** sacrificed opens, or **{exploration_cost/total_opens*100:.2f}%** of total opens
-                        
-                        Note: If exploration cost is negative (new SLs outperform the best initial SL), it's set to zero.
-                        """)
+                    # Create dataframe with simulation results
+                    sim_data = []
+                    for i, (actual, counterfactual) in enumerate(zip(actual_open_rates, counterfactual_open_rates)):
+                        diff = counterfactual - actual
+                        sim_data.append({
+                            "Simulation": i+1,
+                            "Actual Open Rate (%)": f"{actual:.2f}",
+                            "Counterfactual Open Rate (%)": f"{counterfactual:.2f}",
+                            "Difference (%)": f"{diff:.2f}",
+                            "Exploration Result": "Cost" if diff > 0 else "Gain"
+                        })
                     
-                    cols = st.columns(4)
-                    with cols[0]:
-                        st.metric("Sacrificed Opens", f"{int(exploration_cost):,}")
-                    with cols[1]:
-                        total_opens = sum([last_week_data[f'{sl}_cumulative_opens'] 
-                                        for sl in used_sls 
-                                        if f'{sl}_cumulative_opens' in last_week_data])
-                        st.metric("Sacrifice Percentage", f"{exploration_cost/total_opens*100:.2f}%" if total_opens > 0 else "0.00%")
-                    with cols[2]:
-                        st.metric("Potential Opens (New SLs)", f"{int(potential_opens):,}")
-                    with cols[3]:
-                        st.metric("Actual Opens (New SLs)", f"{int(actual_opens):,}")
+                    sim_df = pd.DataFrame(sim_data)
+                    st.dataframe(sim_df)
                     
-                    # 5. Calculate weekly performance delta for new subject lines
-                    st.subheader("Weekly Performance Delta for New Subject Lines")
-                    with st.expander("ℹ️ How is performance delta calculated?"):
-                        st.markdown("""
-                        **Performance delta** measures how new subject lines perform relative to the best initial subject line on a weekly basis.
-                        
-                        **Formula:**
-                        ```
-                        For each week where new SLs are introduced:
-                            Delta = New SL CTR - Best Initial SL CTR for that week
-                        ```
-                        
-                        **Interpretation:**
-                        - **Positive delta**: The new subject line outperformed the best initial subject line that week
-                        - **Negative delta**: The new subject line underperformed compared to the best initial subject line
-                        
-                        The chart shows the average delta across all new subject lines introduced each week.
-                        
-                        This metric helps evaluate whether exploration of new subject lines is yielding better options
-                        than sticking with the initial set.
-                        """)
+                    # Display exploration results summary
+                    costs_count = sum(1 for d in differences if d > 0)
+                    gains_count = sum(1 for d in differences if d <= 0)
                     
-                    delta_data = []
-                    for _, row in result_df.iterrows():
-                        week_num = int(row['week'])
-                        if week_num == 1:  # Skip week 1
-                            continue
-                            
-                        # Get active subject lines for this week
-                        active_sls = row['active_sls'].split(',') if 'active_sls' in row else []
+                    st.markdown(f"""
+                    **Exploration Results Summary:**
+                    - In {costs_count} simulations ({costs_count/n_simulations*100:.1f}%), exploration resulted in a cost (lower open rate)
+                    - In {gains_count} simulations ({gains_count/n_simulations*100:.1f}%), exploration resulted in a gain (equal or higher open rate)
+                    """)
+                    
+                    # Add exploration efficiency metrics
+                    if 'exploration_cost' in aggregate_results and 'exploration_percentage' in aggregate_results:
+                        st.subheader("Exploration Efficiency")
                         
-                        # Find new subject lines introduced this week
-                        week_new_sls = []
-                        for sl in active_sls:
-                            if sl not in initial_sls:
-                                # Check if this was the first week for this subject line
-                                is_first_week = True
-                                for prev_idx, prev_row in result_df.iterrows():
-                                    if prev_row['week'] < week_num and 'active_sls' in prev_row and sl in prev_row['active_sls'].split(','):
-                                        is_first_week = False
-                                        break
+                        cost_stats = aggregate_results['exploration_cost']
+                        pct_stats = aggregate_results['exploration_percentage']
+                        
+                        cols = st.columns(2)
+                        with cols[0]:
+                            st.metric("Avg Exploration Cost (Opens)", f"{int(cost_stats['mean']):,}")
+                            st.caption(f"{confidence_level}% CI: [{int(cost_stats['ci_lower']):,}, {int(cost_stats['ci_upper']):,}]")
+                        
+                        with cols[1]:
+                            st.metric("Avg Exploration Cost (%)", f"{pct_stats['mean']:.2f}%")
+                            st.caption(f"{confidence_level}% CI: [{pct_stats['ci_lower']:.2f}%, {pct_stats['ci_upper']:.2f}%]")
+                
+            else:
+                # Single simulation metrics
+                if not result_df.empty:
+                    # Get last week data (excluding prediction row)
+                    last_week_data = result_df.iloc[-2] if len(result_df) > n_weeks else result_df.iloc[-1]
+                    
+                    # Identify initial subject lines
+                    initial_sls = []
+                    first_week = result_df[result_df['week'] == 1]
+                    if not first_week.empty and 'active_sls' in first_week.iloc[0]:
+                        initial_sls = first_week.iloc[0]['active_sls'].split(',')
+                    
+                    # New subject lines
+                    new_sls = [sl for sl in used_sls if sl not in initial_sls]
+                    
+                    # Find best initial subject line
+                    best_initial_sl = None
+                    best_initial_ctr = 0
+                    
+                    for sl in initial_sls:
+                        if f'{sl}_cumulative_ctr' in last_week_data:
+                            ctr = last_week_data[f'{sl}_cumulative_ctr']
+                            if ctr > best_initial_ctr:
+                                best_initial_ctr = ctr
+                                best_initial_sl = sl
+                    
+                    if best_initial_sl:
+                        # Calculate actual total opens and sends
+                        total_sends = 0
+                        total_opens = 0
+                        
+                        # Calculate cumulative opens and sends
+                        for sl in initial_sls + new_sls:
+                            if f'{sl}_cumulative_sends' in last_week_data and f'{sl}_cumulative_opens' in last_week_data:
+                                sl_sends = last_week_data[f'{sl}_cumulative_sends']
+                                sl_opens = last_week_data[f'{sl}_cumulative_opens']
                                 
-                                if is_first_week:
-                                    week_new_sls.append(sl)
+                                total_sends += sl_sends
+                                total_opens += sl_opens
                         
-                        if week_new_sls:
-                            # Calculate performance for best initial SL this week
-                            best_initial_weekly_ctr = 0
-                            best_initial_weekly_sl = None
+                        # Calculate counterfactual opens (if we had used best initial SL for all new SL sends)
+                        counterfactual_opens = total_opens
+                        
+                        for sl in new_sls:
+                            if f'{sl}_cumulative_sends' in last_week_data and f'{sl}_cumulative_opens' in last_week_data:
+                                sl_sends = last_week_data[f'{sl}_cumulative_sends']
+                                sl_opens = last_week_data[f'{sl}_cumulative_opens']
+                                
+                                # Replace with best initial SL performance
+                                counterfactual_opens = counterfactual_opens - sl_opens + (sl_sends * best_initial_ctr / 100)
+                        
+                        # Calculate open rates
+                        actual_open_rate = (total_opens / total_sends) * 100 if total_sends > 0 else 0
+                        counterfactual_open_rate = (counterfactual_opens / total_sends) * 100 if total_sends > 0 else 0
+                        difference = counterfactual_open_rate - actual_open_rate
+                        
+                        # Display results
+                        st.subheader("Open Rate Analysis")
+                        
+                        cols = st.columns(3)
+                        with cols[0]:
+                            st.metric("Actual Open Rate", f"{actual_open_rate:.2f}%")
+                            st.markdown("*Based on the actual subject line performance*")
+                        
+                        with cols[1]:
+                            st.metric("Counterfactual Open Rate", f"{counterfactual_open_rate:.2f}%")
+                            st.markdown("*If only used best initial subject line*")
+                        
+                        with cols[2]:
+                            st.metric("Open Rate Difference", f"{difference:.2f}%", 
+                                     delta=f"{difference:.2f}%" if difference != 0 else None,
+                                     delta_color="inverse")
+                            st.markdown("*Positive = exploration cost, Negative = exploration gain*")
+                        
+                        # Determine if exploration was beneficial or costly
+                        result_type = "cost" if difference > 0 else "gain"
+                        
+                        st.info(f"Exploring new subject lines {('decreased' if difference > 0 else 'increased')} the overall open rate by {abs(difference):.2f}%, which represents an exploration {result_type}.")
+                        
+                        # Detail breakdown for new subject lines
+                        if new_sls:
+                            st.subheader("New Subject Line Performance")
                             
-                            for sl in initial_sls:
-                                if sl in active_sls and f'{sl}_weekly_ctr' in row:
-                                    if row[f'{sl}_weekly_ctr'] > best_initial_weekly_ctr:
-                                        best_initial_weekly_ctr = row[f'{sl}_weekly_ctr']
-                                        best_initial_weekly_sl = sl
-                            
-                            # Calculate delta for each new SL
-                            for new_sl in week_new_sls:
-                                if f'{new_sl}_weekly_ctr' in row and best_initial_weekly_sl:
-                                    new_sl_ctr = row[f'{new_sl}_weekly_ctr']
-                                    delta = new_sl_ctr - best_initial_weekly_ctr
+                            new_sl_data = []
+                            for sl in new_sls:
+                                if f'{sl}_cumulative_sends' in last_week_data and f'{sl}_cumulative_opens' in last_week_data:
+                                    sl_sends = last_week_data[f'{sl}_cumulative_sends']
+                                    sl_opens = last_week_data[f'{sl}_cumulative_opens']
                                     
-                                    delta_data.append({
-                                        'Week': week_num,
-                                        'New Subject Line': new_sl,
-                                        'New SL CTR (%)': new_sl_ctr,
-                                        'Best Initial SL': best_initial_weekly_sl,
-                                        'Best Initial CTR (%)': best_initial_weekly_ctr,
-                                        'Delta (%)': delta
+                                    # Calculate actual and counterfactual opens
+                                    sl_actual_rate = (sl_opens / sl_sends) * 100 if sl_sends > 0 else 0
+                                    sl_potential_opens = sl_sends * best_initial_ctr / 100
+                                    sl_diff = sl_potential_opens - sl_opens
+                                    sl_pct_diff = (sl_diff / sl_potential_opens) * 100 if sl_potential_opens > 0 else 0
+                                    
+                                    new_sl_data.append({
+                                        "Subject Line": sl,
+                                        "Sends": f"{int(sl_sends):,}",
+                                        "Actual Opens": f"{int(sl_opens):,}",
+                                        "Actual Rate (%)": f"{sl_actual_rate:.2f}",
+                                        "Potential Opens": f"{int(sl_potential_opens):,}",
+                                        "Best Rate (%)": f"{best_initial_ctr:.2f}",
+                                        "Difference": f"{int(sl_diff):,}",
+                                        "Performance": f"{-sl_pct_diff:.2f}%" if sl_pct_diff < 0 else f"-{sl_pct_diff:.2f}%"
                                     })
-                    
-                    # Display delta data
-                    if delta_data:
-                        delta_df = pd.DataFrame(delta_data)
-                        st.dataframe(delta_df)
-                        
-                        # Visualize delta
-                        fig, ax = plt.subplots(figsize=(10, 5))
-                        
-                        # Group by week and calculate average delta
-                        weekly_avg_delta = delta_df.groupby('Week')['Delta (%)'].mean().reset_index()
-                        
-                        ax.bar(weekly_avg_delta['Week'], weekly_avg_delta['Delta (%)'])
-                        ax.axhline(y=0, color='r', linestyle='-', alpha=0.3)
-                        plt.title('Average CTR Delta (New SLs vs Best Initial SL)')
-                        plt.xlabel('Week')
-                        plt.ylabel('Delta (%)')
-                        plt.grid(True, alpha=0.3)
-                        st.pyplot(fig)
+                            
+                            if new_sl_data:
+                                new_sl_df = pd.DataFrame(new_sl_data)
+                                st.dataframe(new_sl_df)
+                            else:
+                                st.info("No data available for new subject lines.")
+                        else:
+                            st.info("No new subject lines were introduced in this simulation.")
                     else:
-                        st.info("No new subject lines were introduced after week 1.")
+                        st.warning("Could not identify the best initial subject line.")
                 else:
-                    st.warning("Could not calculate metrics - not enough data for initial subject lines.")
-            else:
-                st.warning("Could not identify initial subject lines in the data.")
-                
-            # 6. Add summary metrics for parameter tuning
-            st.subheader("Parameter Tuning Metrics")
-            with st.expander("ℹ️ How to interpret parameter tuning metrics?"):
-                st.markdown("""
-                **Parameter tuning metrics** help you optimize the MAB simulation settings:
-                
-                1. **Simulation Duration**: Number of weeks the simulation ran for, which may be less than the configured maximum if a winner was found early
-                
-                2. **Exploration Efficiency**: Calculated as (Actual Opens from New SLs) ÷ (Potential Opens from New SLs) × 100
-                   - A value close to 100% means new subject lines performed nearly as well as the best initial subject line
-                   - Higher values are better, indicating effective exploration
-                
-                3. **Avg Weekly CTR**: The average CTR across all weeks and all active subject lines
-                   - Useful for comparing overall performance across simulation runs
-                
-                4. **Distribution Balance**: Measures how evenly the final distribution is spread among subject lines
-                   - Calculated as 1 - (Standard Deviation ÷ Mean) for final distribution values
-                   - A value close to 1 indicates an even distribution
-                   - A value close to 0 indicates allocation concentrated on few subject lines
-                
-                **How to use these metrics:**
-                Run multiple simulations with different parameter combinations (ε, New SL Weeks, Max SLs) to find the optimal configuration 
-                that balances exploration and exploitation for your use case.
-                """)
-                
-            total_weeks = max(result_df['week']) if not result_df.empty else 0
-            
-            # Calculate exploration efficiency
-            if 'potential_opens' in locals() and potential_opens > 0:
-                exploration_efficiency = actual_opens / potential_opens * 100
-            else:
-                exploration_efficiency = 0
-                
-            # Calculate average weekly CTR
-            weekly_ctr_avg = weekly_ctr_df.mean().mean() if not weekly_ctr_df.empty else 0
-            
-            # Calculate final allocation concentration (how evenly distributed)
-            final_dist = [last_week_data[f'{sl}_distribution'] for sl in used_sls if f'{sl}_distribution' in last_week_data and last_week_data[f'{sl}_distribution'] > 0]
-            if final_dist:
-                final_dist_concentration = 1 - (np.std(final_dist) / np.mean(final_dist) if np.mean(final_dist) > 0 else 0)
-            else:
-                final_dist_concentration = 0
-                
-            # Display metrics
-            cols = st.columns(4)
-            with cols[0]:
-                st.metric("Simulation Duration", f"{total_weeks} weeks")
-            with cols[1]:
-                st.metric("Exploration Efficiency", f"{exploration_efficiency:.2f}%")
-            with cols[2]:
-                st.metric("Avg Weekly CTR", f"{weekly_ctr_avg:.2f}%")
-            with cols[3]:
-                st.metric("Distribution Balance", f"{final_dist_concentration:.2f}")
-                
-            # Parameter combination performance
-            st.info(f"Parameter Configuration: ε={epsilon}, New SL Weeks={new_sl_weeks}, Max SLs={max_subjectlines}")
+                    st.warning("Insufficient data to calculate metrics.")
         
         # Visualizations Tab
         with tab4:
-            st.subheader("Visualizations")
+            st.subheader("Distribution and CTR Visualizations")
             
-            viz_col1, viz_col2 = st.columns(2)
+            if run_monte_carlo and aggregate_results:
+                st.info(f"Showing aggregate results from {n_simulations} simulations with {confidence_level}% confidence intervals")
+                
+                # Distribution over time - Monte Carlo version
+                st.subheader("Average Subject Line Distribution Over Time")
+                
+                # Collect distribution data across all simulations for each week and subject line
+                max_weeks = max(len(df) for df in all_simulation_results)
+                
+                # Plot average distributions from aggregate_results
+                fig, ax = plt.subplots(figsize=(10, 6))
+                weeks_range = list(range(1, max_weeks + 1))
+                
+                for sl in used_sls:
+                    if sl in aggregate_results['weekly_distributions']:
+                        # Collect mean values for each week
+                        values = []
+                        for week in range(1, max_weeks + 1):
+                            if week in aggregate_results['weekly_distributions'][sl]:
+                                values.append(aggregate_results['weekly_distributions'][sl][week]['mean'] * 100)  # Convert to percentage
+                            else:
+                                values.append(0)
+                        
+                        # Only plot if subject line has non-zero distribution
+                        if any(v > 0 for v in values):
+                            ax.plot(weeks_range[:len(values)], values, marker='o', label=sl)
+                
+                ax.set_xlabel('Week')
+                ax.set_ylabel('Distribution (%)')
+                ax.set_title('Average Subject Line Distribution Over Time (Across All Simulations)')
+                ax.grid(True, alpha=0.3)
+                ax.legend()
+                
+                st.pyplot(fig)
+                
+                # CTR over time - Monte Carlo version
+                st.subheader("Average Cumulative CTR Over Time with Confidence Intervals")
+                
+                # Create plot with confidence intervals
+                fig, ax = plt.subplots(figsize=(10, 6))
+                
+                for sl in used_sls:
+                    if sl in aggregate_results['cumulative_ctrs']:
+                        # Collect mean and CI values for each week
+                        mean_values = []
+                        ci_lows = []
+                        ci_highs = []
+                        valid_weeks = []
+                        
+                        for week in range(1, max_weeks + 1):
+                            if week in aggregate_results['cumulative_ctrs'][sl]:
+                                stats = aggregate_results['cumulative_ctrs'][sl][week]
+                                if stats['mean'] > 0:  # Only include weeks with data
+                                    mean_values.append(stats['mean'])
+                                    ci_lows.append(stats['ci_lower'])
+                                    ci_highs.append(stats['ci_upper'])
+                                    valid_weeks.append(week)
+                        
+                        # Only plot if we have data
+                        if mean_values:
+                            # Plot the mean line
+                            ax.plot(valid_weeks, mean_values, marker='o', label=sl)
+                            
+                            # Add confidence interval
+                            ax.fill_between(
+                                valid_weeks,
+                                ci_lows,
+                                ci_highs,
+                                alpha=0.2
+                            )
+                
+                ax.set_xlabel('Week')
+                ax.set_ylabel('CTR (%)')
+                ax.set_title(f'Average Cumulative CTR Over Time with {confidence_level}% Confidence Intervals')
+                ax.grid(True, alpha=0.3)
+                ax.legend()
+                
+                st.pyplot(fig)
+                
+                # Heat map of final distribution across simulations
+                st.subheader("Final Distribution Heatmap")
+                st.caption("Shows the distribution that was used in the final week of each simulation (not the prediction for the next week)")
+                
+                # Collect final distribution data from all simulation DataFrames
+                heatmap_data = []
+                
+                for i, sim_df in enumerate(all_simulation_results):
+                    # Get the last real week (not prediction)
+                    last_week = sim_df.iloc[-2] if len(sim_df) > n_weeks else sim_df.iloc[-1]
+                    
+                    row_data = {'Simulation': i + 1}
+                    for sl in used_sls:
+                        if f'{sl}_distribution' in last_week:
+                            row_data[sl] = last_week[f'{sl}_distribution'] * 100  # Convert to percentage
+                        else:
+                            row_data[sl] = 0
+                    
+                    heatmap_data.append(row_data)
+                
+                if heatmap_data:
+                    heatmap_df = pd.DataFrame(heatmap_data)
+                    
+                    # Only keep columns with some distribution
+                    cols_to_keep = ['Simulation'] + [col for col in heatmap_df.columns if col != 'Simulation' and heatmap_df[col].sum() > 0]
+                    heatmap_df = heatmap_df[cols_to_keep]
+                    
+                    # Set index to simulation number
+                    heatmap_df.set_index('Simulation', inplace=True)
+                    
+                    # Create heatmap
+                    plt.figure(figsize=(12, max(6, len(heatmap_df) * 0.3)))
+                    sns.heatmap(heatmap_df, annot=True, cmap="YlGnBu", fmt=".1f", cbar_kws={'label': 'Distribution (%)'})
+                    plt.title('Final Distribution Across Simulations')
+                    plt.tight_layout()
+                    
+                    st.pyplot(plt)
             
-            with viz_col1:
+            else:
+                # Original single-simulation visualizations
                 # Distribution over time
-                st.subheader("Distribution Over Time")
-                # Exclude the last row (prediction) if it exists
-                plot_dist_df = dist_df.iloc[:-1] if len(result_df) > n_weeks else dist_df
+                st.subheader("Subject Line Distribution Over Time")
                 
+                # Create plot
                 fig, ax = plt.subplots(figsize=(10, 6))
-                plot_dist_df.plot(ax=ax)
-                plt.title("Subject Line Distribution Over Time")
-                plt.xlabel("Week")
-                plt.ylabel("Distribution (%)")
-                plt.legend(title="Subject Line")
-                plt.grid(True, alpha=0.3)
-                st.pyplot(fig)
                 
-                # Subject Line Status
-                st.subheader("Subject Line Status Over Time")
+                for sl, values in weekly_dists.items():
+                    # Only plot if the subject line has some non-zero distribution
+                    if any(v > 0 for v in values):
+                        ax.plot(result_df['week'], values, marker='o', label=sl)
                 
-                # Create a heatmap of status
-                status_values = {'inactive': 0, 'new': 1, 'standard': 2}
-                status_numeric = status_df.applymap(lambda x: status_values.get(x, 0))
+                ax.set_xlabel('Week')
+                ax.set_ylabel('Distribution')
+                ax.set_title('Subject Line Distribution Over Time')
+                ax.grid(True, alpha=0.3)
+                ax.legend()
                 
-                fig, ax = plt.subplots(figsize=(10, 6))
-                sns.heatmap(status_numeric.T, cmap=['white', 'blue', 'green'], 
-                           cbar_kws={'ticks': [0.5, 1.5, 2.5], 'label': 'Status'},
-                           linewidths=0.5)
-                ax.set_yticks(np.arange(len(status_numeric.columns)) + 0.5)
-                ax.set_yticklabels(status_numeric.columns)
-                plt.colorbar(ax.collections[0], ticks=[0.5, 1.5, 2.5], 
-                            label='Status')
-                ax.collections[0].colorbar.set_ticklabels(['Inactive', 'New', 'Standard'])
-                plt.title("Subject Line Status by Week")
-                plt.tight_layout()
-                st.pyplot(fig)
-                
-                # Cumulative CTR
-                st.subheader("Cumulative CTR Over Time")
-                
-                # Only plot for subject lines with data
-                valid_cols = [col for col in cumulative_ctr_df.columns 
-                             if cumulative_ctr_df[col].max() > 0]
-                plot_ctr_df = cumulative_ctr_df[valid_cols]
-                
-                fig, ax = plt.subplots(figsize=(10, 6))
-                plot_ctr_df.iloc[:-1].plot(ax=ax) if len(result_df) > n_weeks else plot_ctr_df.plot(ax=ax)
-                plt.title("Cumulative CTR by Subject Line")
-                plt.xlabel("Week")
-                plt.ylabel("CTR (%)")
-                plt.legend(title="Subject Line")
-                plt.grid(True, alpha=0.3)
-                st.pyplot(fig)
-            
-            with viz_col2:
-                # Weekly sends
-                st.subheader("Weekly Sends by Subject Line")
-                
-                # Only plot for subject lines with data
-                valid_cols = [col for col in weekly_sends_df.columns 
-                             if weekly_sends_df[col].max() > 0]
-                plot_sends_df = weekly_sends_df[valid_cols]
-                
-                fig, ax = plt.subplots(figsize=(10, 6))
-                (plot_sends_df.iloc[:-1].plot.bar(ax=ax, stacked=True) 
-                 if len(result_df) > n_weeks else plot_sends_df.plot.bar(ax=ax, stacked=True))
-                plt.title("Weekly Sends by Subject Line")
-                plt.xlabel("Week")
-                plt.ylabel("Number of Sends")
-                plt.legend(title="Subject Line")
-                plt.grid(True, alpha=0.3)
                 st.pyplot(fig)
                 
                 # Weekly CTR
-                st.subheader("Weekly CTR by Subject Line")
+                st.subheader("Weekly CTR")
                 
-                # Only plot for subject lines with data
-                valid_cols = [col for col in weekly_ctr_df.columns 
-                             if weekly_ctr_df[col].max() > 0]
-                plot_weekly_ctr_df = weekly_ctr_df[valid_cols]
-                
+                # Create plot
                 fig, ax = plt.subplots(figsize=(10, 6))
-                (plot_weekly_ctr_df.iloc[:-1].plot(ax=ax, marker='o') 
-                 if len(result_df) > n_weeks else plot_weekly_ctr_df.plot(ax=ax, marker='o'))
-                plt.title("Weekly CTR by Subject Line")
-                plt.xlabel("Week")
-                plt.ylabel("CTR (%)")
-                plt.legend(title="Subject Line")
-                plt.grid(True, alpha=0.3)
-                st.pyplot(fig)
-            
-            # Additional visualizations spanning the full width
-            st.subheader("Final Performance Comparison")
-            
-            # Get active subject lines in the last actual week (not prediction)
-            last_week = result_df.iloc[-2] if len(result_df) > n_weeks else result_df.iloc[-1]
-            last_week_active_sls = last_week['active_sls'].split(',') if 'active_sls' in last_week else []
-            
-            # Only include active subject lines
-            fig, ax = plt.subplots(figsize=(12, 6))
-            x = np.arange(len(last_week_active_sls))
-            width = 0.35
-            
-            last_week_sends = [last_week[f'{sl}_cumulative_sends'] if f'{sl}_cumulative_sends' in last_week else 0 
-                              for sl in last_week_active_sls]
-            last_week_opens = [last_week[f'{sl}_cumulative_opens'] if f'{sl}_cumulative_opens' in last_week else 0 
-                              for sl in last_week_active_sls]
-            
-            ax.bar(x - width/2, last_week_sends, width, label='Sends')
-            ax.bar(x + width/2, last_week_opens, width, label='Opens')
-            ax.set_xticks(x)
-            ax.set_xticklabels(last_week_active_sls)
-            ax.legend()
-            plt.title("Final Send and Open Counts by Subject Line")
-            plt.xlabel("Subject Line")
-            plt.ylabel("Count")
-            plt.grid(True, alpha=0.3)
-            st.pyplot(fig)
-            
-            # Evolution of distributions
-            st.subheader("Evolution of Subject Line Distribution")
-            
-            # Only plot for subject lines that were active at some point
-            active_sls_ever = []
-            for _, row in result_df.iterrows():
-                if 'active_sls' in row:
-                    active_sls_ever.extend(row['active_sls'].split(','))
-            active_sls_ever = list(set(active_sls_ever))
-            
-            # Create a dataframe with just the active subject lines
-            active_dist_data = {}
-            for sl in active_sls_ever:
-                if f'{sl}_distribution' in result_df.columns:
-                    active_dist_data[sl] = result_df[f'{sl}_distribution'] * 100
-            
-            active_dist_df = pd.DataFrame(active_dist_data)
-            active_dist_df.index = [f"Week {int(w)}" for w in result_df['week']]
-            
-            fig, ax = plt.subplots(figsize=(12, 6))
-            
-            # Create a stacked area chart
-            if len(result_df) > n_weeks:
-                active_dist_df.iloc[:-1].plot.area(ax=ax, stacked=True, alpha=0.7)
-            else:
-                active_dist_df.plot.area(ax=ax, stacked=True, alpha=0.7)
                 
-            plt.title("Evolution of Subject Line Distribution")
-            plt.xlabel("Week")
-            plt.ylabel("Distribution (%)")
-            plt.legend(title="Subject Line")
-            plt.grid(True, alpha=0.3)
-            st.pyplot(fig)
-            
-            # Final distribution pie chart
-            st.subheader("Final Distribution Pie Chart")
-            
-            # Get final distribution for active subject lines
-            final_week = result_df.iloc[-1]
-            active_sls_final = final_week['active_sls'].split(',') if 'active_sls' in final_week else []
-            
-            # Filter out zero distributions
-            labels = []
-            sizes = []
-            
-            for sl in active_sls_final:
-                if f'{sl}_distribution' in final_week and final_week[f'{sl}_distribution'] > 0:
-                    labels.append(sl)
-                    sizes.append(final_week[f'{sl}_distribution'] * 100)
-            
-            if sizes:  # Only create pie chart if there are non-zero values
-                fig, ax = plt.subplots(figsize=(10, 10))
-                ax.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=90, shadow=True)
-                ax.axis('equal')  # Equal aspect ratio ensures that pie is drawn as a circle
-                plt.title("Final Subject Line Distribution")
+                for sl in weekly_ctr_df.columns:
+                    ax.plot(weekly_ctr_df.index, weekly_ctr_df[sl], marker='o', label=sl)
+                
+                ax.set_xlabel('Week')
+                ax.set_ylabel('CTR (%)')
+                ax.set_title('Weekly CTR by Subject Line')
+                ax.grid(True, alpha=0.3)
+                ax.legend()
+                
                 st.pyplot(fig)
+                
+                # Cumulative CTR
+                st.subheader("Cumulative CTR")
+                
+                # Create plot
+                fig, ax = plt.subplots(figsize=(10, 6))
+                
+                for sl in cumulative_ctr_df.columns:
+                    ax.plot(cumulative_ctr_df.index, cumulative_ctr_df[sl], marker='o', label=sl)
+                
+                ax.set_xlabel('Week')
+                ax.set_ylabel('CTR (%)')
+                ax.set_title('Cumulative CTR by Subject Line')
+                ax.grid(True, alpha=0.3)
+                ax.legend()
+                
+                st.pyplot(fig)
+            
+            # For both single and Monte Carlo: Epsilon & CTR Relationship
+            if run_monte_carlo and aggregate_results:
+                st.subheader("Parameter Sensitivity Analysis")
+                
+                # If we have aggregate results, show epsilon vs CTR
+                st.info("Run multiple simulations with different epsilon values to enable this analysis.")
             else:
-                st.write("No non-zero distribution values to display.")
+                st.subheader("New Subject Line Performance")
+                
+                # Show relationship between new and initial subject lines
+                # Identify initial and new subject lines
+                initial_sls = []
+                for sl in used_sls:
+                    for idx, row in result_df.iterrows():
+                        if row['week'] == 1 and 'active_sls' in row and sl in row['active_sls'].split(','):
+                            initial_sls.append(sl)
+                            break
+                
+                new_sls = [sl for sl in used_sls if sl not in initial_sls]
+                
+                if new_sls:
+                    # Get final CTRs
+                    last_week_data = result_df.iloc[-2] if len(result_df) > n_weeks else result_df.iloc[-1]
+                    
+                    final_ctrs = {}
+                    for sl in used_sls:
+                        if f'{sl}_cumulative_ctr' in last_week_data:
+                            final_ctrs[sl] = last_week_data[f'{sl}_cumulative_ctr']
+                    
+                    # Create plot comparing initial vs new subject lines
+                    fig, ax = plt.subplots(figsize=(10, 6))
+                    
+                    x_labels = []
+                    ctr_values = []
+                    colors = []
+                    
+                    for sl in sorted(final_ctrs.keys(), key=lambda x: final_ctrs[x], reverse=True):
+                        if f'{sl}_cumulative_ctr' in last_week_data and last_week_data[f'{sl}_cumulative_ctr'] > 0:
+                            x_labels.append(sl)
+                            ctr_values.append(final_ctrs[sl])
+                            colors.append('blue' if sl in initial_sls else 'orange')
+                    
+                    bars = ax.bar(x_labels, ctr_values, color=colors)
+                    
+                    ax.set_xlabel('Subject Line')
+                    ax.set_ylabel('Final CTR (%)')
+                    ax.set_title('Final CTR by Subject Line (Blue = Initial, Orange = New)')
+                    ax.grid(True, axis='y', alpha=0.3)
+                    plt.xticks(rotation=45)
+                    
+                    for bar in bars:
+                        height = bar.get_height()
+                        ax.annotate(f'{height:.2f}%',
+                                   xy=(bar.get_x() + bar.get_width() / 2, height),
+                                   xytext=(0, 3),  # 3 points vertical offset
+                                   textcoords="offset points",
+                                   ha='center', va='bottom')
+                    
+                    st.pyplot(fig)
+                else:
+                    st.info("No new subject lines were introduced during the simulation.")
         
         # Raw Data Tab
         with tab5:
@@ -830,22 +1175,22 @@ if st.sidebar.button("Run Simulation"):
                                "Cumulative CTR", "Complete Data"])
             
             with data_tabs[0]:
-                st.dataframe(dist_df)
+                st.dataframe(pd.DataFrame(weekly_dists).T)
             
             with data_tabs[1]:
-                st.dataframe(status_df)
+                st.dataframe(pd.DataFrame(index=result_df['week']).applymap(lambda x: result_df[f'{x}_status']))
             
             with data_tabs[2]:
-                st.dataframe(weekly_sends_df)
+                st.dataframe(pd.DataFrame(index=result_df['week']).applymap(lambda x: weekly_ctr_df[x].sum()))
             
             with data_tabs[3]:
-                st.dataframe(weekly_opens_df)
+                st.dataframe(pd.DataFrame(index=result_df['week']).applymap(lambda x: result_df[f'{x}_opens']))
             
             with data_tabs[4]:
-                st.dataframe(cumulative_sends_df)
+                st.dataframe(pd.DataFrame(index=result_df['week']).applymap(lambda x: result_df[f'{x}_cumulative_sends']))
             
             with data_tabs[5]:
-                st.dataframe(cumulative_opens_df)
+                st.dataframe(pd.DataFrame(index=result_df['week']).applymap(lambda x: result_df[f'{x}_cumulative_opens']))
             
             with data_tabs[6]:
                 st.dataframe(weekly_ctr_df)
