@@ -1,8 +1,9 @@
 import pandas as pd
 import numpy as np
 from ts_mab import run_ts_mab
+import random
 
-def generate_weekly_sends(n_weeks=10, n_subjectlines=5, max_subjectlines=15, epsilon=0.2, new_sl_weeks=2, custom_min_rates=None, custom_max_rates=None, verbose=True):
+def generate_weekly_sends(n_weeks=10, n_subjectlines=5, max_subjectlines=15, epsilon=0.2, new_sl_weeks=2, custom_min_rates=None, custom_max_rates=None, real_campaign=False, verbose=True):
     """
     Generate random total sends for each week.
     
@@ -22,6 +23,8 @@ def generate_weekly_sends(n_weeks=10, n_subjectlines=5, max_subjectlines=15, eps
         Dictionary mapping subject line names to minimum open rates
     custom_max_rates : dict, default=None
         Dictionary mapping subject line names to maximum open rates
+    real_campaign : bool, default=False
+        Whether to simulate a real campaign where new subject lines sample open rates from initial ones
     verbose : bool, default=True
         Whether to print detailed simulation information
         
@@ -34,7 +37,7 @@ def generate_weekly_sends(n_weeks=10, n_subjectlines=5, max_subjectlines=15, eps
     validate_inputs(n_subjectlines, max_subjectlines)
     
     # Initialize simulation data
-    simulation_data = initialize_simulation(n_subjectlines, max_subjectlines, custom_min_rates, custom_max_rates, verbose)
+    simulation_data = initialize_simulation(n_subjectlines, max_subjectlines, custom_min_rates, custom_max_rates, real_campaign, verbose)
     
     # Run weekly simulation
     run_weekly_simulation(simulation_data, n_weeks, epsilon, new_sl_weeks, verbose)
@@ -57,7 +60,7 @@ def validate_inputs(n_subjectlines, max_subjectlines):
     return n_subjectlines
 
 
-def initialize_simulation(n_subjectlines, max_subjectlines, custom_min_rates, custom_max_rates, verbose=True):
+def initialize_simulation(n_subjectlines, max_subjectlines, custom_min_rates, custom_max_rates, real_campaign, verbose=True):
     """Initialize all data structures needed for the simulation."""
     # Create subject line lists
     all_sls = [f"SL_{i}" for i in range(1, max_subjectlines + 1)]
@@ -78,7 +81,7 @@ def initialize_simulation(n_subjectlines, max_subjectlines, custom_min_rates, cu
     new_zero_dist_sls = set()
     
     # Generate open rate ranges for all possible subject lines
-    sl_open_rate_ranges = generate_open_rate_ranges(all_sls, custom_min_rates, custom_max_rates, verbose)
+    sl_open_rate_ranges = generate_open_rate_ranges(all_sls, custom_min_rates, custom_max_rates, real_campaign, verbose)
     
     # Create lists to store all simulation data
     all_weeks = []
@@ -115,33 +118,60 @@ def initialize_simulation(n_subjectlines, max_subjectlines, custom_min_rates, cu
         'all_cumulative_opens': all_cumulative_opens,
         'all_active_sls': all_active_sls,
         'all_sl_statuses': all_sl_statuses,
-        'next_dist': None  # Will be set during simulation
+        'next_dist': None,  # Will be set during simulation
+        'real_campaign': real_campaign
     }
     
     return simulation_data
 
 
-def generate_open_rate_ranges(all_sls, custom_min_rates, custom_max_rates, verbose=True):
+def generate_open_rate_ranges(all_sls, custom_min_rates, custom_max_rates, real_campaign=False, verbose=True):
     """Generate open rate ranges for all subject lines."""
     sl_open_rate_ranges = {}
-    for sl in all_sls:
+    # Get number of initial subject lines
+    n_initial_sls = len([sl for sl in custom_min_rates.keys()]) if custom_min_rates else 0
+    
+    # If no custom rates are provided, ensure we have at least rates for initial subject lines (first 5)
+    n_subjects_to_generate = max(5, n_initial_sls) if not custom_min_rates else 0
+    
+    for i, sl in enumerate(all_sls):
+        # For initial subject lines, use custom rates if provided
         if custom_min_rates and custom_max_rates and sl in custom_min_rates and sl in custom_max_rates:
-            # Use custom rates if provided
             min_rate = custom_min_rates[sl]
             max_rate = custom_max_rates[sl]
+            sl_open_rate_ranges[sl] = (min_rate, max_rate)
         else:
-            # Otherwise generate random rates
-            min_rate = np.random.uniform(0.1, 0.25)
-            max_rate = min_rate + np.random.uniform(0.05, 0.15)
-        
-        sl_open_rate_ranges[sl] = (min_rate, max_rate)
+            # For new subject lines, either generate random rates now or leave for sampling later
+            # Always generate for initial n_subjects_to_generate if no custom rates
+            if not real_campaign or i < n_subjects_to_generate or i < n_initial_sls:
+                # Generate random rates for non-real campaign or initial subject lines
+                min_rate = np.random.uniform(0.1, 0.25)
+                max_rate = min_rate + np.random.uniform(0.05, 0.15)
+                sl_open_rate_ranges[sl] = (min_rate, max_rate)
+            # For real campaign simulation, new subject lines' rates will be sampled later
     
     # Print the open rate ranges being used
     if verbose:
         print("Subject Line Open Rate Ranges:")
-        for sl in all_sls:
-            min_rate, max_rate = sl_open_rate_ranges[sl]
-            print(f"{sl}: {min_rate*100:.2f}% - {max_rate*100:.2f}%")
+        
+        # First print initial subject lines
+        initial_sls = all_sls[:n_initial_sls] if n_initial_sls > 0 else all_sls[:5]
+        print("Initial Subject Lines:")
+        for sl in initial_sls:
+            if sl in sl_open_rate_ranges:
+                min_rate, max_rate = sl_open_rate_ranges[sl]
+                print(f"{sl}: {min_rate*100:.2f}% - {max_rate*100:.2f}%")
+        
+        # Then print potential new subject lines
+        if len(all_sls) > len(initial_sls) and not real_campaign:
+            print("\nPotential New Subject Lines:")
+            for sl in all_sls[len(initial_sls):]:
+                if sl in sl_open_rate_ranges:
+                    min_rate, max_rate = sl_open_rate_ranges[sl]
+                    print(f"{sl}: {min_rate*100:.2f}% - {max_rate*100:.2f}%")
+        elif real_campaign:
+            print("\nNew subject lines will sample open rates from initial subject lines during simulation.")
+        
         print("\n")
     
     return sl_open_rate_ranges
@@ -306,7 +336,17 @@ def calculate_opens(data, sl_idx, sends):
         return 0
     
     sl_name = data['all_sls'][sl_idx]
-    min_rate, max_rate = data['sl_open_rate_ranges'][sl_name]
+    
+    # Check if the subject line has open rates defined
+    if sl_name in data['sl_open_rate_ranges']:
+        min_rate, max_rate = data['sl_open_rate_ranges'][sl_name]
+    else:
+        # If not, generate a random open rate on the fly
+        min_rate = np.random.uniform(0.1, 0.25)
+        max_rate = min_rate + np.random.uniform(0.05, 0.15)
+        # Store for future use
+        data['sl_open_rate_ranges'][sl_name] = (min_rate, max_rate)
+        
     return round(np.random.uniform(min_rate, max_rate) * sends)
 
 
@@ -331,6 +371,32 @@ def store_weekly_data(data, week, week_total_sends, distribution, sends_arr, ope
 def add_new_subject_lines(data, new_sls_to_add, week, verbose=True):
     """Add new subject lines from the available pool."""
     new_sl_indices = []
+    
+    # Get initial subject lines' open rate ranges to sample from
+    initial_sl_indices = list(range(data['n_subjectlines']))
+    initial_sl_names = [data['all_sls'][idx] for idx in initial_sl_indices]
+    initial_open_rates = [data['sl_open_rate_ranges'][sl] for sl in initial_sl_names if sl in data['sl_open_rate_ranges']]
+    
+    # Calculate statistics for initial subject lines
+    if data.get('real_campaign', False) and initial_open_rates:
+        # Extract min rates and max rates
+        min_rates = [rate[0] for rate in initial_open_rates]
+        max_rates = [rate[1] for rate in initial_open_rates]
+        
+        # Calculate mean and standard deviation
+        mean_min_rate = np.mean(min_rates)
+        mean_max_rate = np.mean(max_rates)
+        std_min_rate = np.std(min_rates) if len(min_rates) > 1 else 0.02
+        std_max_rate = np.std(max_rates) if len(max_rates) > 1 else 0.02
+        
+        # Calculate average range between min and max
+        avg_range = mean_max_rate - mean_min_rate
+        
+        if verbose:
+            print(f"Initial SL min rate distribution: mean={mean_min_rate*100:.2f}%, std={std_min_rate*100:.2f}%")
+            print(f"Initial SL max rate distribution: mean={mean_max_rate*100:.2f}%, std={std_max_rate*100:.2f}%")
+            print(f"Average range: {avg_range*100:.2f}%")
+    
     for _ in range(new_sls_to_add):
         if data['available_sls']:
             new_sl = data['available_sls'].pop(0)
@@ -339,6 +405,42 @@ def add_new_subject_lines(data, new_sls_to_add, week, verbose=True):
             new_sl_indices.append(new_sl_idx)
             data['sl_introduction_weeks'][new_sl_idx] = week
             data['sl_status'][new_sl_idx] = "new"
+            
+            # Check if simulation is in real campaign mode
+            if data.get('real_campaign', False) and initial_open_rates:
+                # Add standard error component (reduces as we have more samples)
+                standard_error = 1.0 / np.sqrt(len(initial_open_rates))
+                
+                # Sample from a normal distribution based on mean and std of initial subject lines
+                # The standard error factor adds a bit more variability for smaller sample sizes
+                min_rate = np.random.normal(mean_min_rate, std_min_rate * (1 + standard_error))
+                
+                # For max_rate, either:
+                # 1. Sample independently from max_rate distribution
+                # 2. Add the average range to the sampled min_rate
+                # We'll use approach #2 as it ensures consistent ranges
+                max_rate = min_rate + avg_range + np.random.normal(0, std_max_rate * 0.5)
+                
+                # Ensure max_rate is greater than min_rate by at least 2%
+                max_rate = max(min_rate + 0.02, max_rate)
+                
+                if verbose:
+                    print(f"New subject line {new_sl} open rate (statistically sampled):")
+                    print(f"  Min rate: {min_rate*100:.2f}% (mean={mean_min_rate*100:.2f}%, std={std_min_rate*100:.2f}%)")
+                    print(f"  Max rate: {max_rate*100:.2f}% (mean={mean_max_rate*100:.2f}%, std={std_max_rate*100:.2f}%)")
+                    print(f"  Range: {(max_rate-min_rate)*100:.2f}% (avg={avg_range*100:.2f}%)")
+            elif new_sl in data['sl_open_rate_ranges']:
+                # Already has open rates defined (non-real campaign mode)
+                min_rate, max_rate = data['sl_open_rate_ranges'][new_sl]
+            else:
+                # Fallback to random generation if needed
+                min_rate = np.random.uniform(0.1, 0.25)
+                max_rate = min_rate + np.random.uniform(0.05, 0.15)
+                
+            data['sl_open_rate_ranges'][new_sl] = (min_rate, max_rate)
+            
+            if verbose and not data.get('real_campaign', False):
+                print(f"New subject line {new_sl} open rate: {min_rate*100:.2f}% - {max_rate*100:.2f}%")
     
     if verbose and new_sl_indices:
         print(f"Added new subject lines: {[data['all_sls'][i] for i in new_sl_indices]}")
@@ -465,6 +567,142 @@ def check_for_simulation_end(data, verbose=True):
     return False
 
 
+def calculate_campaign_metrics(data, results, n_weeks):
+    """
+    Calculate campaign-wide metrics to show how adding new subject lines affects performance.
+    
+    This function calculates:
+    1. Overall campaign CTR for each week
+    2. Improvement in CTR compared to using only initial subject lines
+    3. Cumulative CTR with and without new subject lines
+    """
+    initial_sls_indices = list(range(data['n_subjectlines']))
+    initial_sl_names = [data['all_sls'][idx] for idx in initial_sls_indices]
+    
+    # Add campaign-wide metrics to each week's results
+    for i, week_data in enumerate(results):
+        week = week_data['week']
+        
+        # Calculate total sends and opens for this week
+        total_weekly_sends = week_data['total_sends']
+        total_weekly_opens = 0
+        
+        # Calculate total weekly numbers for all subject lines
+        for j in range(data['max_subjectlines']):
+            sl_name = data['all_sls'][j]
+            total_weekly_opens += week_data.get(f'{sl_name}_opens', 0)
+        
+        # Calculate metrics only for initial subject lines
+        initial_weekly_sends = 0
+        initial_weekly_opens = 0
+        for sl_name in initial_sl_names:
+            initial_weekly_sends += week_data.get(f'{sl_name}_sends', 0)
+            initial_weekly_opens += week_data.get(f'{sl_name}_opens', 0)
+        
+        # Calculate new subject lines metrics
+        new_sl_weekly_sends = total_weekly_sends - initial_weekly_sends
+        new_sl_weekly_opens = total_weekly_opens - initial_weekly_opens
+        
+        # Weekly CTR calculations
+        if total_weekly_sends > 0:
+            week_data['overall_weekly_ctr'] = total_weekly_opens / total_weekly_sends * 100
+        else:
+            week_data['overall_weekly_ctr'] = 0
+            
+        if initial_weekly_sends > 0:
+            week_data['initial_sl_weekly_ctr'] = initial_weekly_opens / initial_weekly_sends * 100
+        else:
+            week_data['initial_sl_weekly_ctr'] = 0
+            
+        if new_sl_weekly_sends > 0:
+            week_data['new_sl_weekly_ctr'] = new_sl_weekly_opens / new_sl_weekly_sends * 100
+        else:
+            week_data['new_sl_weekly_ctr'] = 0
+        
+        # Calculate total cumulative metrics up to this week
+        cumulative_total_sends = 0
+        cumulative_total_opens = 0
+        cumulative_initial_sends = 0
+        cumulative_initial_opens = 0
+        
+        for j in range(i+1):
+            prev_week_data = results[j]
+            
+            # All subject lines
+            cumulative_total_sends += prev_week_data['total_sends']
+            
+            week_total_opens = 0
+            for sl_idx in range(data['max_subjectlines']):
+                sl_name = data['all_sls'][sl_idx]
+                week_total_opens += prev_week_data.get(f'{sl_name}_opens', 0)
+            
+            cumulative_total_opens += week_total_opens
+            
+            # Initial subject lines only
+            week_initial_sends = 0
+            week_initial_opens = 0
+            for sl_name in initial_sl_names:
+                week_initial_sends += prev_week_data.get(f'{sl_name}_sends', 0)
+                week_initial_opens += prev_week_data.get(f'{sl_name}_opens', 0)
+            
+            cumulative_initial_sends += week_initial_sends
+            cumulative_initial_opens += week_initial_opens
+        
+        # Calculate cumulative CTRs
+        if cumulative_total_sends > 0:
+            week_data['cumulative_campaign_ctr'] = cumulative_total_opens / cumulative_total_sends * 100
+        else:
+            week_data['cumulative_campaign_ctr'] = 0
+            
+        if cumulative_initial_sends > 0:
+            week_data['cumulative_initial_sl_ctr'] = cumulative_initial_opens / cumulative_initial_sends * 100
+        else:
+            week_data['cumulative_initial_sl_ctr'] = 0
+        
+        # Calculate theoretical CTR if we had used only the best initial subject line
+        if i > 0:  # After week 1, we have some data to determine the best initial SL
+            best_initial_sl = None
+            best_initial_ctr = 0
+            
+            for sl_name in initial_sl_names:
+                if week_data.get(f'{sl_name}_cumulative_sends', 0) > 0:
+                    sl_ctr = week_data.get(f'{sl_name}_cumulative_ctr', 0)
+                    if sl_ctr > best_initial_ctr:
+                        best_initial_ctr = sl_ctr
+                        best_initial_sl = sl_name
+            
+            week_data['best_initial_sl'] = best_initial_sl
+            week_data['best_initial_sl_ctr'] = best_initial_ctr
+            
+            # Calculate counterfactual situation if we had used only the best initial SL
+            counterfactual_opens = cumulative_total_opens
+            
+            # For each new subject line, remove its opens and replace with what would have happened
+            # if we had used the best initial subject line instead
+            if best_initial_sl:
+                new_sl_sends = cumulative_total_sends - cumulative_initial_sends
+                new_sl_opens = cumulative_total_opens - cumulative_initial_opens
+                
+                # Replace new SL performance with best initial SL
+                counterfactual_opens = cumulative_initial_opens + (new_sl_sends * best_initial_ctr / 100)
+                
+                # Calculate the counterfactual CTR
+                if cumulative_total_sends > 0:
+                    week_data['counterfactual_ctr'] = counterfactual_opens / cumulative_total_sends * 100
+                else:
+                    week_data['counterfactual_ctr'] = 0
+                
+                # Calculate the benefit of using MAB with new subject lines
+                week_data['mab_benefit'] = week_data['cumulative_campaign_ctr'] - week_data['counterfactual_ctr']
+        
+        # Record how many new subject lines were active
+        active_sl_names = week_data['active_sls'].split(',')
+        new_active_sls = [sl for sl in active_sl_names if sl not in initial_sl_names]
+        week_data['num_new_active_sls'] = len(new_active_sls)
+        
+    return results
+
+
 def create_results_dataframe(data, n_weeks):
     """Create a comprehensive DataFrame with all simulation results."""
     results = []
@@ -501,6 +739,9 @@ def create_results_dataframe(data, n_weeks):
     # Add next week's predicted distribution if simulation didn't end with a winner
     if len(data['all_weeks']) == n_weeks:
         add_prediction_row(data, results, n_weeks)
+    
+    # Calculate campaign-wide metrics
+    results = calculate_campaign_metrics(data, results, n_weeks)
     
     return pd.DataFrame(results)
 
@@ -544,6 +785,13 @@ def add_prediction_row(data, results, n_weeks):
 
 
 if __name__ == "__main__":
-    result_df = generate_weekly_sends(n_weeks=5, n_subjectlines=5, max_subjectlines=10, epsilon=0.2, new_sl_weeks=2)
-    print("\nSimulation Results DataFrame:")
-    print(result_df)
+    # Test the generate_weekly_sends function with some random data
+    print("Running simulation with random data (not real campaign):")
+    result_df = generate_weekly_sends(n_weeks=5, n_subjectlines=5, max_subjectlines=10, epsilon=0.2, new_sl_weeks=2, real_campaign=False)
+    print("\nSimulation Results DataFrame (Summary):")
+    print(result_df[['week', 'total_sends', 'active_sls', 'overall_weekly_ctr', 'cumulative_campaign_ctr']].head())
+    
+    print("\n\nRunning simulation with random data (real campaign mode):")
+    result_df = generate_weekly_sends(n_weeks=5, n_subjectlines=5, max_subjectlines=10, epsilon=0.2, new_sl_weeks=2, real_campaign=True)
+    print("\nSimulation Results DataFrame (Summary):")
+    print(result_df[['week', 'total_sends', 'active_sls', 'overall_weekly_ctr', 'cumulative_campaign_ctr']].head())
