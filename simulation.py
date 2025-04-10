@@ -3,7 +3,7 @@ import numpy as np
 from ts_mab import run_ts_mab
 import random
 
-def generate_weekly_sends(n_weeks=10, n_subjectlines=5, max_subjectlines=15, epsilon=0.2, new_sl_weeks=2, custom_min_rates=None, custom_max_rates=None, real_campaign=False, verbose=True):
+def generate_weekly_sends(n_weeks=10, n_subjectlines=5, max_subjectlines=15, epsilon=0.2, new_sl_weeks=2, custom_min_rates=None, custom_max_rates=None, real_campaign=False, include_special_sl=False, special_sl_std_dev=0.0, verbose=True):
     """
     Generate random total sends for each week.
     
@@ -25,6 +25,10 @@ def generate_weekly_sends(n_weeks=10, n_subjectlines=5, max_subjectlines=15, eps
         Dictionary mapping subject line names to maximum open rates
     real_campaign : bool, default=False
         Whether to simulate a real campaign where new subject lines sample open rates from initial ones
+    include_special_sl : bool, default=False
+        Whether to include a special subject line with controlled performance
+    special_sl_std_dev : float, default=0.0
+        How many standard deviations from the mean the special subject line's open rate should be
     verbose : bool, default=True
         Whether to print detailed simulation information
         
@@ -37,7 +41,7 @@ def generate_weekly_sends(n_weeks=10, n_subjectlines=5, max_subjectlines=15, eps
     validate_inputs(n_subjectlines, max_subjectlines)
     
     # Initialize simulation data
-    simulation_data = initialize_simulation(n_subjectlines, max_subjectlines, custom_min_rates, custom_max_rates, real_campaign, verbose)
+    simulation_data = initialize_simulation(n_subjectlines, max_subjectlines, custom_min_rates, custom_max_rates, real_campaign, include_special_sl, special_sl_std_dev, verbose)
     
     # Run weekly simulation
     run_weekly_simulation(simulation_data, n_weeks, epsilon, new_sl_weeks, verbose)
@@ -60,7 +64,7 @@ def validate_inputs(n_subjectlines, max_subjectlines):
     return n_subjectlines
 
 
-def initialize_simulation(n_subjectlines, max_subjectlines, custom_min_rates, custom_max_rates, real_campaign, verbose=True):
+def initialize_simulation(n_subjectlines, max_subjectlines, custom_min_rates, custom_max_rates, real_campaign, include_special_sl, special_sl_std_dev, verbose=True):
     """Initialize all data structures needed for the simulation."""
     # Create subject line lists
     all_sls = [f"SL_{i}" for i in range(1, max_subjectlines + 1)]
@@ -119,7 +123,10 @@ def initialize_simulation(n_subjectlines, max_subjectlines, custom_min_rates, cu
         'all_active_sls': all_active_sls,
         'all_sl_statuses': all_sl_statuses,
         'next_dist': None,  # Will be set during simulation
-        'real_campaign': real_campaign
+        'real_campaign': real_campaign,
+        'include_special_sl': include_special_sl,
+        'special_sl_std_dev': special_sl_std_dev,
+        'special_sl_added': False  # Initialize the special subject line flag
     }
     
     return simulation_data
@@ -397,7 +404,10 @@ def add_new_subject_lines(data, new_sls_to_add, week, verbose=True):
             print(f"Initial SL max rate distribution: mean={mean_max_rate*100:.2f}%, std={std_max_rate*100:.2f}%")
             print(f"Average range: {avg_range*100:.2f}%")
     
-    for _ in range(new_sls_to_add):
+    # Check if we should include a special subject line with controlled performance
+    should_add_special_sl = data.get('include_special_sl', False) and data.get('real_campaign', False) and not data.get('special_sl_added', False)
+    
+    for i in range(new_sls_to_add):
         if data['available_sls']:
             new_sl = data['available_sls'].pop(0)
             new_sl_idx = data['all_sls'].index(new_sl)
@@ -406,29 +416,54 @@ def add_new_subject_lines(data, new_sls_to_add, week, verbose=True):
             data['sl_introduction_weeks'][new_sl_idx] = week
             data['sl_status'][new_sl_idx] = "new"
             
+            # Check if this should be our special subject line
+            is_special_sl = should_add_special_sl and i == 0  # Make the first new SL the special one
+            
             # Check if simulation is in real campaign mode
             if data.get('real_campaign', False) and initial_open_rates:
-                # Add standard error component (reduces as we have more samples)
-                standard_error = 1.0 / np.sqrt(len(initial_open_rates))
-                
-                # Sample from a normal distribution based on mean and std of initial subject lines
-                # The standard error factor adds a bit more variability for smaller sample sizes
-                min_rate = np.random.normal(mean_min_rate, std_min_rate * (1 + standard_error))
-                
-                # For max_rate, either:
-                # 1. Sample independently from max_rate distribution
-                # 2. Add the average range to the sampled min_rate
-                # We'll use approach #2 as it ensures consistent ranges
-                max_rate = min_rate + avg_range + np.random.normal(0, std_max_rate * 0.5)
-                
-                # Ensure max_rate is greater than min_rate by at least 2%
-                max_rate = max(min_rate + 0.02, max_rate)
-                
-                if verbose:
-                    print(f"New subject line {new_sl} open rate (statistically sampled):")
-                    print(f"  Min rate: {min_rate*100:.2f}% (mean={mean_min_rate*100:.2f}%, std={std_min_rate*100:.2f}%)")
-                    print(f"  Max rate: {max_rate*100:.2f}% (mean={mean_max_rate*100:.2f}%, std={std_max_rate*100:.2f}%)")
-                    print(f"  Range: {(max_rate-min_rate)*100:.2f}% (avg={avg_range*100:.2f}%)")
+                if is_special_sl:
+                    # Create a special subject line with controlled performance
+                    special_sl_std_dev = data.get('special_sl_std_dev', 0.0)
+                    
+                    # Calculate performance based on standard deviations from mean
+                    min_rate = mean_min_rate + (special_sl_std_dev * std_min_rate)
+                    max_rate = min_rate + avg_range
+                    
+                    # Ensure max_rate is greater than min_rate by at least 2%
+                    max_rate = max(min_rate + 0.02, max_rate)
+                    
+                    # Mark that we've added the special subject line
+                    data['special_sl_added'] = True
+                    data['special_sl_name'] = new_sl
+                    
+                    if verbose:
+                        print(f"Special subject line {new_sl} with performance {special_sl_std_dev:.1f} std devs from mean:")
+                        print(f"  Min rate: {min_rate*100:.2f}% (mean={mean_min_rate*100:.2f}%, std={std_min_rate*100:.2f}%)")
+                        print(f"  Max rate: {max_rate*100:.2f}% (mean={mean_max_rate*100:.2f}%, std={std_max_rate*100:.2f}%)")
+                        print(f"  Range: {(max_rate-min_rate)*100:.2f}% (avg={avg_range*100:.2f}%)")
+                else:
+                    # Regular new subject line - sample from distribution
+                    # Add standard error component (reduces as we have more samples)
+                    standard_error = 1.0 / np.sqrt(len(initial_open_rates))
+                    
+                    # Sample from a normal distribution based on mean and std of initial subject lines
+                    # The standard error factor adds a bit more variability for smaller sample sizes
+                    min_rate = np.random.normal(mean_min_rate, std_min_rate * (1 + standard_error))
+                    
+                    # For max_rate, either:
+                    # 1. Sample independently from max_rate distribution
+                    # 2. Add the average range to the sampled min_rate
+                    # We'll use approach #2 as it ensures consistent ranges
+                    max_rate = min_rate + avg_range + np.random.normal(0, std_max_rate * 0.5)
+                    
+                    # Ensure max_rate is greater than min_rate by at least 2%
+                    max_rate = max(min_rate + 0.02, max_rate)
+                    
+                    if verbose:
+                        print(f"New subject line {new_sl} open rate (statistically sampled):")
+                        print(f"  Min rate: {min_rate*100:.2f}% (mean={mean_min_rate*100:.2f}%, std={std_min_rate*100:.2f}%)")
+                        print(f"  Max rate: {max_rate*100:.2f}% (mean={mean_max_rate*100:.2f}%, std={std_max_rate*100:.2f}%)")
+                        print(f"  Range: {(max_rate-min_rate)*100:.2f}% (avg={avg_range*100:.2f}%)")
             elif new_sl in data['sl_open_rate_ranges']:
                 # Already has open rates defined (non-real campaign mode)
                 min_rate, max_rate = data['sl_open_rate_ranges'][new_sl]
@@ -784,8 +819,339 @@ def add_prediction_row(data, results, n_weeks):
     results.append(next_week_data)
 
 
+def run_multiple_simulations(n_simulations=10, n_weeks=10, n_subjectlines=5, max_subjectlines=15, epsilon=0.2, 
+                          new_sl_weeks=2, real_campaign=True, include_special_sl=False, special_sl_std_dev=0.0, 
+                          verbose=False):
+    """
+    Run multiple simulations with the same parameters and compile results for statistical analysis.
+    
+    Parameters:
+    -----------
+    n_simulations : int, default=10
+        Number of simulations to run
+    n_weeks : int, default=10
+        Number of weeks in each simulation
+    n_subjectlines : int, default=5
+        Initial number of subject lines
+    max_subjectlines : int, default=15
+        Maximum number of subject lines
+    epsilon : float, default=0.2
+        Percentage allocation for new subject lines
+    new_sl_weeks : int, default=2
+        Weeks a new subject line gets epsilon allocation
+    real_campaign : bool, default=True
+        Whether to simulate a real campaign
+    include_special_sl : bool, default=False
+        Whether to include a special subject line
+    special_sl_std_dev : float, default=0.0
+        Standard deviations from mean for special subject line
+    verbose : bool, default=False
+        Whether to print detailed simulation information
+        
+    Returns:
+    --------
+    dict
+        Compiled results from all simulations
+    """
+    all_results = []
+    
+    # Run multiple simulations
+    for i in range(n_simulations):
+        if verbose:
+            print(f"\nRunning simulation {i+1}/{n_simulations}")
+        
+        # Run a single simulation
+        result_df = generate_weekly_sends(
+            n_weeks=n_weeks, 
+            n_subjectlines=n_subjectlines,
+            max_subjectlines=max_subjectlines,
+            epsilon=epsilon,
+            new_sl_weeks=new_sl_weeks,
+            real_campaign=real_campaign,
+            include_special_sl=include_special_sl,
+            special_sl_std_dev=special_sl_std_dev,
+            verbose=verbose
+        )
+        
+        all_results.append(result_df)
+    
+    # Compile statistics
+    return compile_simulation_statistics(all_results, n_weeks)
+
+
+def compile_simulation_statistics(simulation_results, n_weeks):
+    """
+    Compile statistics from multiple simulation runs.
+    
+    Parameters:
+    -----------
+    simulation_results : list
+        List of DataFrames from multiple simulation runs
+    n_weeks : int
+        Number of weeks in each simulation
+        
+    Returns:
+    --------
+    dict
+        Compiled statistics for all metrics
+    """
+    # Initialize storage for compiled statistics
+    compiled_stats = {
+        'weeks': list(range(1, n_weeks + 1)),
+        'overall_ctr': {
+            'mean': [],
+            'std': [],
+            'ci_lower': [],
+            'ci_upper': []
+        },
+        'initial_sl_ctr': {
+            'mean': [],
+            'std': [],
+            'ci_lower': [],
+            'ci_upper': []
+        },
+        'counterfactual_ctr': {
+            'mean': [],
+            'std': [],
+            'ci_lower': [],
+            'ci_upper': []
+        },
+        'num_new_active_sls': {
+            'mean': [],
+            'std': []
+        }
+    }
+    
+    # For each week, calculate statistics across all simulations
+    for week in range(1, n_weeks + 1):
+        # Collect metrics for this week across all simulations
+        overall_ctrs = []
+        initial_sl_ctrs = []
+        counterfactual_ctrs = []
+        num_new_sls = []
+        
+        for df in simulation_results:
+            # Filter to this week's data
+            week_data = df[df['week'] == week]
+            
+            if not week_data.empty:
+                if 'cumulative_campaign_ctr' in week_data.columns:
+                    overall_ctrs.append(week_data['cumulative_campaign_ctr'].values[0])
+                
+                if 'cumulative_initial_sl_ctr' in week_data.columns:
+                    initial_sl_ctrs.append(week_data['cumulative_initial_sl_ctr'].values[0])
+                
+                if 'counterfactual_ctr' in week_data.columns and week > 1:
+                    counterfactual_ctrs.append(week_data['counterfactual_ctr'].values[0])
+                
+                if 'num_new_active_sls' in week_data.columns:
+                    num_new_sls.append(week_data['num_new_active_sls'].values[0])
+        
+        # Calculate statistics for this week
+        if overall_ctrs:
+            mean_overall = np.mean(overall_ctrs)
+            std_overall = np.std(overall_ctrs)
+            compiled_stats['overall_ctr']['mean'].append(mean_overall)
+            compiled_stats['overall_ctr']['std'].append(std_overall)
+            # 95% confidence interval
+            compiled_stats['overall_ctr']['ci_lower'].append(mean_overall - 1.96 * std_overall / np.sqrt(len(overall_ctrs)))
+            compiled_stats['overall_ctr']['ci_upper'].append(mean_overall + 1.96 * std_overall / np.sqrt(len(overall_ctrs)))
+        
+        if initial_sl_ctrs:
+            mean_initial = np.mean(initial_sl_ctrs)
+            std_initial = np.std(initial_sl_ctrs)
+            compiled_stats['initial_sl_ctr']['mean'].append(mean_initial)
+            compiled_stats['initial_sl_ctr']['std'].append(std_initial)
+            # 95% confidence interval
+            compiled_stats['initial_sl_ctr']['ci_lower'].append(mean_initial - 1.96 * std_initial / np.sqrt(len(initial_sl_ctrs)))
+            compiled_stats['initial_sl_ctr']['ci_upper'].append(mean_initial + 1.96 * std_initial / np.sqrt(len(initial_sl_ctrs)))
+        
+        if counterfactual_ctrs:
+            mean_counterfactual = np.mean(counterfactual_ctrs)
+            std_counterfactual = np.std(counterfactual_ctrs)
+            compiled_stats['counterfactual_ctr']['mean'].append(mean_counterfactual)
+            compiled_stats['counterfactual_ctr']['std'].append(std_counterfactual)
+            # 95% confidence interval
+            compiled_stats['counterfactual_ctr']['ci_lower'].append(mean_counterfactual - 1.96 * std_counterfactual / np.sqrt(len(counterfactual_ctrs)))
+            compiled_stats['counterfactual_ctr']['ci_upper'].append(mean_counterfactual + 1.96 * std_counterfactual / np.sqrt(len(counterfactual_ctrs)))
+        elif week > 1:
+            # Fill with previous week's values if not available
+            compiled_stats['counterfactual_ctr']['mean'].append(compiled_stats['counterfactual_ctr']['mean'][-1] if compiled_stats['counterfactual_ctr']['mean'] else 0)
+            compiled_stats['counterfactual_ctr']['std'].append(compiled_stats['counterfactual_ctr']['std'][-1] if compiled_stats['counterfactual_ctr']['std'] else 0)
+            compiled_stats['counterfactual_ctr']['ci_lower'].append(compiled_stats['counterfactual_ctr']['ci_lower'][-1] if compiled_stats['counterfactual_ctr']['ci_lower'] else 0)
+            compiled_stats['counterfactual_ctr']['ci_upper'].append(compiled_stats['counterfactual_ctr']['ci_upper'][-1] if compiled_stats['counterfactual_ctr']['ci_upper'] else 0)
+        
+        if num_new_sls:
+            compiled_stats['num_new_active_sls']['mean'].append(np.mean(num_new_sls))
+            compiled_stats['num_new_active_sls']['std'].append(np.std(num_new_sls))
+    
+    return compiled_stats
+
+
+def plot_campaign_improvement_with_ci(stats_list, labels, title="Campaign CTR Improvement with New Subject Lines", 
+                                     figsize=(12, 8), show_ci=True, save_path=None):
+    """
+    Plot campaign improvement metrics with confidence intervals.
+    
+    Parameters:
+    -----------
+    stats_list : list
+        List of dictionaries containing compiled statistics from multiple simulations
+    labels : list
+        Labels for each set of statistics
+    title : str, default="Campaign CTR Improvement with New Subject Lines"
+        Plot title
+    figsize : tuple, default=(12, 8)
+        Figure size
+    show_ci : bool, default=True
+        Whether to show confidence intervals
+    save_path : str, default=None
+        Path to save the figure
+        
+    Returns:
+    --------
+    matplotlib.figure.Figure
+        The created figure
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.ticker as mtick
+    
+    plt.figure(figsize=figsize)
+    
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b']
+    line_styles = ['-', '-', '--']
+    
+    # Plot each set of statistics
+    for i, (stats, label) in enumerate(zip(stats_list, labels)):
+        weeks = stats['weeks']
+        
+        # Plot overall campaign CTR
+        color_idx = i % len(colors)
+        plt.plot(weeks, stats['overall_ctr']['mean'], 
+                 marker='o', linestyle=line_styles[0], color=colors[color_idx], 
+                 label=f"{label} - Overall Campaign CTR")
+        
+        if show_ci:
+            plt.fill_between(weeks, 
+                            stats['overall_ctr']['ci_lower'], 
+                            stats['overall_ctr']['ci_upper'],
+                            color=colors[color_idx], alpha=0.2)
+        
+        # Plot initial subject lines CTR
+        plt.plot(weeks, stats['initial_sl_ctr']['mean'], 
+                 marker='s', linestyle=line_styles[1], color=colors[color_idx],
+                 label=f"{label} - Initial Subject Lines CTR")
+        
+        if show_ci:
+            plt.fill_between(weeks, 
+                            stats['initial_sl_ctr']['ci_lower'], 
+                            stats['initial_sl_ctr']['ci_upper'],
+                            color=colors[color_idx], alpha=0.1)
+        
+        # Plot counterfactual CTR (best initial SL only)
+        if 'counterfactual_ctr' in stats and len(stats['counterfactual_ctr']['mean']) > 0:
+            counterfactual_weeks = weeks[1:]  # Counterfactual starts from week 2
+            counterfactual_means = stats['counterfactual_ctr']['mean']
+            
+            plt.plot(counterfactual_weeks, counterfactual_means, 
+                    marker='^', linestyle=line_styles[2], color=colors[color_idx],
+                    label=f"{label} - Best Initial SL Only (counterfactual)")
+            
+            if show_ci and 'ci_lower' in stats['counterfactual_ctr'] and 'ci_upper' in stats['counterfactual_ctr']:
+                plt.fill_between(counterfactual_weeks, 
+                                stats['counterfactual_ctr']['ci_lower'], 
+                                stats['counterfactual_ctr']['ci_upper'],
+                                color=colors[color_idx], alpha=0.1)
+        
+        # Add annotations for number of new subject lines
+        if 'num_new_active_sls' in stats:
+            for w_idx, week in enumerate(weeks):
+                if w_idx > 0:  # Skip first week which has no new SLs
+                    num_new_sls = stats['num_new_active_sls']['mean'][w_idx]
+                    if num_new_sls > 0:
+                        y_pos = stats['overall_ctr']['mean'][w_idx]
+                        plt.annotate(f"{num_new_sls:.0f} new SLs", 
+                                    (week, y_pos),
+                                    textcoords="offset points",
+                                    xytext=(0, 10), 
+                                    ha='center',
+                                    fontsize=9,
+                                    color=colors[color_idx])
+    
+    # Set axis labels and title
+    plt.xlabel('Week', fontsize=12)
+    plt.ylabel('CTR (%)', fontsize=12)
+    plt.title(title, fontsize=16)
+    
+    # Format y-axis as percentage
+    plt.gca().yaxis.set_major_formatter(mtick.PercentFormatter(decimals=1))
+    
+    # Add grid
+    plt.grid(True, linestyle='--', alpha=0.7)
+    
+    # Add legend
+    plt.legend(loc='best', fontsize=10)
+    
+    # Adjust layout
+    plt.tight_layout()
+    
+    # Save figure if path is provided
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    
+    return plt.gcf()
+
+
+def compare_multiple_configurations(config_list, labels, n_simulations=10, verbose=False):
+    """
+    Compare multiple parameter configurations with statistical analysis.
+    
+    Parameters:
+    -----------
+    config_list : list
+        List of dictionaries containing simulation parameters
+    labels : list
+        Labels for each configuration
+    n_simulations : int, default=10
+        Number of simulations to run for each configuration
+    verbose : bool, default=False
+        Whether to print detailed simulation information
+        
+    Returns:
+    --------
+    tuple
+        (Figure, List of compiled statistics)
+    """
+    all_stats = []
+    
+    for i, config in enumerate(config_list):
+        print(f"Running configuration: {labels[i]} ({n_simulations} simulations)")
+        
+        # Extract parameters from config
+        params = {
+            'n_weeks': config.get('n_weeks', 10),
+            'n_subjectlines': config.get('n_subjectlines', 5),
+            'max_subjectlines': config.get('max_subjectlines', 15),
+            'epsilon': config.get('epsilon', 0.2),
+            'new_sl_weeks': config.get('new_sl_weeks', 2),
+            'real_campaign': config.get('real_campaign', True),
+            'include_special_sl': config.get('include_special_sl', False),
+            'special_sl_std_dev': config.get('special_sl_std_dev', 0.0),
+            'verbose': verbose
+        }
+        
+        # Run simulations for this configuration
+        stats = run_multiple_simulations(n_simulations=n_simulations, **params)
+        all_stats.append(stats)
+    
+    # Generate plot comparing all configurations
+    fig = plot_campaign_improvement_with_ci(all_stats, labels)
+    
+    return fig, all_stats
+
+
 if __name__ == "__main__":
-    # Test the generate_weekly_sends function with some random data
+    # Original examples
     print("Running simulation with random data (not real campaign):")
     result_df = generate_weekly_sends(n_weeks=5, n_subjectlines=5, max_subjectlines=10, epsilon=0.2, new_sl_weeks=2, real_campaign=False)
     print("\nSimulation Results DataFrame (Summary):")
@@ -795,3 +1161,43 @@ if __name__ == "__main__":
     result_df = generate_weekly_sends(n_weeks=5, n_subjectlines=5, max_subjectlines=10, epsilon=0.2, new_sl_weeks=2, real_campaign=True)
     print("\nSimulation Results DataFrame (Summary):")
     print(result_df[['week', 'total_sends', 'active_sls', 'overall_weekly_ctr', 'cumulative_campaign_ctr']].head())
+    
+    print("\n\nRunning simulation with a special subject line (+2 std dev from mean):")
+    result_df = generate_weekly_sends(n_weeks=5, n_subjectlines=5, max_subjectlines=10, epsilon=0.2, new_sl_weeks=2, 
+                                    real_campaign=True, include_special_sl=True, special_sl_std_dev=2.0)
+    print("\nSimulation Results DataFrame (Summary):")
+    print(result_df[['week', 'total_sends', 'active_sls', 'overall_weekly_ctr', 'cumulative_campaign_ctr']].head())
+    
+    # New example demonstrating multiple configuration comparison
+    print("\n\nComparing multiple configurations with statistical analysis:")
+    configs = [
+        {
+            'n_weeks': 10,
+            'include_special_sl': False
+        },
+        {
+            'n_weeks': 10,
+            'include_special_sl': True,
+            'special_sl_std_dev': 2.0  # +2 std devs (significantly better)
+        },
+        {
+            'n_weeks': 10,
+            'include_special_sl': True,
+            'special_sl_std_dev': -2.0  # -2 std devs (significantly worse)
+        }
+    ]
+    
+    labels = [
+        "Baseline",
+        "With Special SL (+2σ)",
+        "With Special SL (-2σ)"
+    ]
+    
+    print("Running comparison of 3 configurations (baseline, +2σ special SL, -2σ special SL)")
+    print("This will run multiple simulations for each configuration to generate statistical confidence intervals.")
+    print("Please wait, this may take a minute...")
+    fig, stats = compare_multiple_configurations(configs, labels, n_simulations=3, verbose=False)
+    
+    # In a real environment, you would display or save the figure
+    print("Comparison analysis complete. The figure would show the comparison with confidence intervals.")
+    # fig.savefig('mab_comparison.png')

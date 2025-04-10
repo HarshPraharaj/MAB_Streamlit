@@ -304,6 +304,33 @@ if real_campaign:
     2. New subject lines will sample open rates from initial subject lines
     3. This simulates real campaigns where new content performs similar to existing content
     """)
+    
+    # Add option for a specific new subject line with controlled performance
+    include_special_sl = st.sidebar.checkbox("Include Special Subject Line", value=False)
+    if include_special_sl:
+        special_sl_std_dev = st.sidebar.slider(
+            "Special SL Performance (std dev from mean)", 
+            min_value=-10.0, 
+            max_value=10.0, 
+            value=1.0, 
+            step=0.1,
+            help="Set how many standard deviations from the mean the special subject line's open rate should be. Positive values create better-performing subject lines, negative values create worse-performing ones."
+        )
+        
+        st.sidebar.info(f"""
+        A special subject line will be introduced with an open rate approximately {special_sl_std_dev:.1f} standard deviations 
+        from the mean of initial subject lines.
+        
+        - Positive values mean better performance than average
+        - Negative values mean worse performance than average
+        - ±1.0 covers ~68% of normal distribution
+        - ±2.0 covers ~95% of normal distribution
+        - ±3.0 covers ~99.7% of normal distribution
+        - Values beyond ±3.0 represent extremely rare performance (less than 0.3% likelihood)
+        """)
+    else:
+        include_special_sl = False
+        special_sl_std_dev = 0.0
 
 # Add parameter for multiple runs
 st.sidebar.header("Monte Carlo Settings")
@@ -403,6 +430,8 @@ if st.sidebar.button("Run Simulation"):
                         custom_min_rates=custom_min_rates if use_custom_rates else None,
                         custom_max_rates=custom_max_rates if use_custom_rates else None,
                         real_campaign=real_campaign,
+                        include_special_sl=include_special_sl,
+                        special_sl_std_dev=special_sl_std_dev,
                         verbose=(sim_idx == 0)  # Only show verbose output for first run
                     )
                     all_simulation_results.append(result_df)
@@ -425,6 +454,8 @@ if st.sidebar.button("Run Simulation"):
                     custom_min_rates=custom_min_rates if use_custom_rates else None,
                     custom_max_rates=custom_max_rates if use_custom_rates else None,
                     real_campaign=real_campaign,
+                    include_special_sl=include_special_sl,
+                    special_sl_std_dev=special_sl_std_dev,
                     verbose=True
                 )
                 all_simulation_results = [result_df]
@@ -1051,7 +1082,7 @@ if st.sidebar.button("Run Simulation"):
         # Visualizations Tab
         with tab4:
             st.subheader("Distribution and CTR Visualizations")
-            
+
             if run_monte_carlo and aggregate_results:
                 st.info(f"Showing aggregate results from {n_simulations} simulations with {confidence_level}% confidence intervals")
                 
